@@ -595,13 +595,42 @@ async def test_the_wall_clock_deadline_takes_the_wind_down() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_provider_failure_is_retried_before_anything_else() -> None:
+    """One failed stream and a good one after it is a run that answers normally."""
+    rc = LoopConstants(
+        model_context_window=4_096, llm_transient_error_retry_backoff_base_seconds=0.0
+    )
+    recovered = _ScriptedLLM([{"text": "Here is the answer after the retry."}])
+    llm = _FailingLLM(LLMProviderError("provider down"), recovered)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    retries = [
+        e
+        for e in events
+        if e.type is EventType.STATE_CHANGED
+        and e.payload.get("reason") == "transient_llm_error_retry"
+    ]
+    assert len(retries) == 1
+    assert not [
+        e
+        for e in events
+        if e.type is EventType.STATE_CHANGED
+        and e.payload.get("reason") == "soft_stop_notified"
+    ]
+    assert engine.state is LoopState.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_a_provider_failure_takes_the_wind_down() -> None:
     """The upstream stopped answering; the evidence gathered so far has not.
 
     Terminating here throws away a run that may already have everything it
     needs to answer — which is what the incident this was written for did.
+    The retries come first; the wind-down is what follows when they are spent.
     """
-    rc = LoopConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096, llm_transient_error_retry_max_attempts=0)
     recovered = _ScriptedLLM([{"text": "Here is the answer despite the failure."}])
     llm = _FailingLLM(LLMProviderError("provider down"), recovered)
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
@@ -622,7 +651,11 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
 @pytest.mark.asyncio
 async def test_a_provider_failure_the_wind_down_cannot_rescue_still_reports_it() -> None:
     """The original error is surfaced, not buried under a silent no-answer stop."""
-    rc = LoopConstants(model_context_window=4_096, soft_stop_max_turns=1)
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_max_turns=1,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
 
     class _AlwaysFails:
         def __init__(self) -> None:

@@ -1395,10 +1395,11 @@ class LoopConstants(BaseModel):
         default=2,
         ge=0,
         description=(
-            "Bounded in-place retries for a TRANSIENT upstream LLM failure — a "
-            "429 rate-limit (``LLMRateLimitError``) or a request/stream timeout "
-            "(``LLMTimeoutError``) — raised on the assistant stream. These "
-            "classes are retryable per the error classifier, so the loop first "
+            "Bounded in-place retries for an upstream LLM failure raised on the "
+            "assistant stream: a 429 rate-limit (``LLMRateLimitError``), a "
+            "request/stream timeout (``LLMTimeoutError``), a stream that went "
+            "idle (``LLMStreamIdleError``) or the adapters' catch-all "
+            "(``LLMProviderError``). The loop first "
             "steps down the run's model priority list (when one is configured "
             "and the advance budget is not spent), and otherwise re-opens the "
             "SAME stream up to this many times with a backoff between attempts "

@@ -644,7 +644,7 @@ async def test_provider_error_without_fallback_is_terminal(
     deliver an answer, which is a different behaviour with its own coverage.
     This pins the terminal a deployment gets with the wind-down disabled.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(llm_transient_error_retry_max_attempts=0, model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[LLMProviderError("provider down")],
@@ -667,7 +667,7 @@ async def test_last_rung_failure_is_terminal(
 
     Wind-down off so the call count measures the chain, not the wind-down.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(llm_transient_error_retry_max_attempts=0, model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -743,7 +743,7 @@ async def test_provider_error_backstop_persists_partial_text_to_history(
     into a history carrying no record of what the user had already been shown —
     so the live view and a reload disagree about the same turn.
     """
-    rc = LoopConstants(
+    rc = LoopConstants(llm_transient_error_retry_max_attempts=0,
         model_context_window=4096,
         terminal_tool_nudge_enabled=True,
     )
@@ -1298,7 +1298,7 @@ async def test_death_spiral_guard_set_on_provider_error(
     Wind-down off so the failure IS terminal: with it on the run gets a narrowed
     turn to still answer, and a run that answers never reaches the guard.
     """
-    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(llm_transient_error_retry_max_attempts=0, model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     engine.llm = _ScriptedFailureLLM(  # type: ignore[assignment]
         exceptions=[LLMProviderError("burst error")],
@@ -1389,7 +1389,7 @@ async def test_death_spiral_guard_disabled_via_rc(
     Diagnostic mode — Stop / SessionEnd hooks SHOULD see the failure
     (e.g. error-classifier hooks).
     """
-    rc = LoopConstants(
+    rc = LoopConstants(llm_transient_error_retry_max_attempts=0,
         model_context_window=4096,
         skip_terminal_hooks_on_llm_error=False,
         soft_stop_enabled=False,

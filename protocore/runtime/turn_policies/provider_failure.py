@@ -178,8 +178,10 @@ class ProviderFailurePolicy:
             return
 
         if isinstance(exc, LLMStreamIdleError):
+            # A stream that went quiet is as often a queue as a hang: the same
+            # request is tried again, bounded, before the run winds down on it.
             async for event in self._recover(
-                turn, exc, kind="llm_stream_idle", wind_down_when_stuck=True
+                turn, exc, kind="llm_stream_idle", retryable=True, wind_down_when_stuck=True
             ):
                 yield event
             return
@@ -199,8 +201,12 @@ class ProviderFailurePolicy:
             return
 
         if isinstance(exc, LLMProviderError):
+            # The adapters' catch-all: a 5xx, a dropped connection, a refused
+            # request. The first two pass on a retry and the third costs one
+            # more call against a cached prompt, so the bounded retry comes
+            # before the wind-down here too.
             async for event in self._recover(
-                turn, exc, kind="llm_provider_error", wind_down_when_stuck=True
+                turn, exc, kind="llm_provider_error", retryable=True, wind_down_when_stuck=True
             ):
                 yield event
             return
