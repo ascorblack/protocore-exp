@@ -167,6 +167,8 @@ class CompactionState:
     retry_count: int = 0
     summarised_turn_ids: set[str] = field(default_factory=set)
     blob_refs_created: list[str] = field(default_factory=list)
+    failed_anchor_keys: dict[str, int] = field(default_factory=dict)
+    """How many times the summariser failed on a unit, by anchor key; past the limit the unit is left alone."""
 
     def reset_retries(self) -> None:
         self.retry_count = 0
@@ -1128,6 +1130,8 @@ class _SummaryOutcome:
     anchor_key: str
     replacement: Message | None
     tokens_freed: int
+    failed: bool = False
+    """The call itself went wrong (raised, cut, or no summary in the reply), as opposed to a summary no smaller."""
 
 
 def _is_plain_operator_turn(message: Message) -> bool:
@@ -1208,8 +1212,9 @@ def _summary_word_budget(before_tokens: int, rc: LoopConstants) -> int:
     # The prompt must not ask for more than the reply may hold: a budget above the
     # output cap is a summary that is always truncated, never parsed and never
     # committed, so the largest units are exactly the ones that never shrink.
-    # Two tokens per word leaves room for the structure around the words.
-    ceiling = rc.compaction_summary_max_output_tokens // 2
+    # The per-word cost on the way out is a property of the script and the JSON
+    # around the words, not of English: see compaction_summary_output_tokens_per_word.
+    ceiling = rc.compaction_summary_max_output_tokens // rc.compaction_summary_output_tokens_per_word
     return max(rc.compaction_summary_min_words, min(scaled, ceiling))
 
 
@@ -1254,10 +1259,10 @@ async def _run_summariser(
         response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
     except Exception as exc:
         _logger.warning("summariser failed for %s; skipping (err=%s)", unit_label, exc)
-        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0, failed=True)
     summary_text = _summary_from_response(response.message.text, unit_label)
     if not summary_text:
-        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0, failed=True)
     wrapped = _wrap_compaction_summary(anchor_key, summary_text)
     after_tokens = estimate_tokens(wrapped, rc)
     if after_tokens >= before_tokens:
@@ -1473,6 +1478,10 @@ async def run_tier2_summarisation(
         anchor_key = _stable_turn_key(anchor)
         if anchor_key in state.summarised_turn_ids:
             continue
+        if state.failed_anchor_keys.get(anchor_key, 0) >= rc.compaction_summary_failed_unit_max_attempts:
+            # The summariser has failed on this unit as often as it may: paying
+            # again buys the same failure. The fold tier still gets its turn.
+            continue
         # Exhaustive across EVERY member of the unit (assistant turn + its
         # tool results), so the summary preserves the tool exchange.
         unit_messages = [history[member] for member in unit.indices]
@@ -1520,6 +1529,8 @@ async def run_tier2_summarisation(
         )
         for (unit, _key, _members, _before), outcome in zip(batch, outcomes, strict=True):
             if outcome.replacement is None:
+                if outcome.failed:
+                    state.failed_anchor_keys[outcome.anchor_key] = state.failed_anchor_keys.get(outcome.anchor_key, 0) + 1
                 continue
             replacements[unit.anchor_idx] = outcome.replacement
             # Every non-anchor member of the unit (the matching tool results) is

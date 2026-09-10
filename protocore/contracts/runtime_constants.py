@@ -431,6 +431,29 @@ class LoopConstants(BaseModel):
             "the identifiers the summary must keep verbatim."
         ),
     )
+    compaction_summary_output_tokens_per_word: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Tokens one word of a summary is assumed to cost on the way OUT, "
+            "used to cap the word budget the summariser is asked for at what "
+            "compaction_summary_max_output_tokens can hold. Two was the English "
+            "figure; JSON escaping and a non-Latin script (Cyrillic runs at three "
+            "or four tokens a word) put a budget sized that way past the cap on "
+            "every large unit, and a summary the cap cuts is never parsed."
+        ),
+    )
+    compaction_summary_failed_unit_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "How many passes may try to summarise the same unit and fail (the "
+            "provider raised, the reply was cut or carried no summary) before "
+            "the run stops paying for that unit. A unit that fails the same way "
+            "twice fails the same way on every later pass, and the per-iteration "
+            "gate would otherwise buy the same failure each iteration."
+        ),
+    )
     compaction_summary_tokens_per_word: int = Field(
         default=6,
         ge=1,
