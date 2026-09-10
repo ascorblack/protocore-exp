@@ -48,6 +48,7 @@ from protocore.contracts.turn_policy import (
     TurnCoordinate,
     TurnDirective,
 )
+from protocore.logging_utils import get_logger
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.error_kinds import INTERNAL_ERROR_KIND
 from protocore.runtime.events import TurnEvent
@@ -86,6 +87,8 @@ BackoffSeconds = Callable[[Any, int, BaseException], float]
 #: Write down that the turn crashed, naming the turn it crashed on.
 CrashLogger = Callable[[Any, BaseException], None]
 
+
+_logger = get_logger(__name__)
 
 class ProviderFailurePolicy:
     """Rank the recoveries a failed stream attempt has, and take the best."""
@@ -171,6 +174,12 @@ class ProviderFailurePolicy:
         exc = turn.stream_error
         if exc is None:
             return
+        _logger.warning(
+            "stream failed in run %s: %s: %s",
+            turn.engine.config.run_id,
+            type(exc).__name__,
+            str(exc)[:400],
+        )
 
         if isinstance(exc, LLMContextWindowExceeded):
             async for event in self._shrink_the_request(turn, exc):

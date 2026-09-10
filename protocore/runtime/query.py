@@ -387,7 +387,8 @@ def _policy_reasoning_cut_event(
 ) -> TurnEvent:
     """Say a cut retry is going out, what it changed, and what the cut round cost."""
     _logger.warning(
-        "reasoning-only length cut: %s chars of reasoning and no answer; retry %s with %s",
+        "reasoning-only length cut in run %s: %s chars of reasoning and no answer; retry %s with %s",
+        engine.config.run_id,
         reasoning_chars,
         round_,
         changed,
