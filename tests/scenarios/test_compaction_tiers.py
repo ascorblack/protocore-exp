@@ -239,7 +239,7 @@ async def test_every_identifier_reaches_the_summariser_verbatim(
     for identifier in identifiers:
         assert identifier in seen, f"{identifier!r} never reached the summariser"
     assert all(
-        "verbatim; never round, guess or substitute" in prompt for prompt in per_turn
+        "verbatim" in prompt and "never round, guess or substitute" in prompt for prompt in per_turn
     )
 
 

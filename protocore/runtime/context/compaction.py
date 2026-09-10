@@ -1314,7 +1314,8 @@ async def _summarise_unit(
         "compaction_turn_summary",
         {
             "turn": _strip_injection_patterns(raw_text),
-            "max_words": _summary_word_budget(before_tokens, rc),
+            "max_words": (budget := _summary_word_budget(before_tokens, rc)),
+            "max_chars": budget * 6,
         },
     )
     return await _run_summariser(
