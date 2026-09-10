@@ -1506,6 +1506,45 @@ class LoopConstants(BaseModel):
             "deployments can tune the nudge per locale."
         ),
     )
+    reasoning_length_cut_retries: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "Retries after a round the output cap cut while the model was "
+            "still reasoning (``finish_reason='length'``, reasoning and nothing "
+            "else). The cut reasoning is not kept and nothing is appended for "
+            "it: each retry sends the same prompt with one knob changed — the "
+            "first lowers the reasoning effort to ``low`` and adds the one nudge "
+            "in ``reasoning_length_cut_nudge_text``, the second switches "
+            "thinking off (``reasoning_length_cut_disable_thinking``). A retry "
+            "that would change nothing is skipped, and past the count the run "
+            "winds down. The knobs go back to their configured values on the "
+            "next round that produces anything. ``0`` disables the retries: the "
+            "first cut winds the run down."
+        ),
+    )
+    reasoning_length_cut_nudge_text: str = Field(
+        default=(
+            "Your previous response reached the output token limit while still "
+            "reasoning, before it produced an answer or a tool call, so it was "
+            "discarded. Respond more concisely: think briefly, then give the "
+            "answer or exactly one tool call."
+        ),
+        description=(
+            "The one synthetic user message sent with the first retry after a "
+            "reasoning-only length cut. It names the mechanical cause and asks "
+            "for a shorter shape; it never asks the model to resume reasoning "
+            "that was not kept."
+        ),
+    )
+    reasoning_length_cut_disable_thinking: bool = Field(
+        default=True,
+        description=(
+            "Whether the last retry after a reasoning-only length cut switches "
+            "thinking off for that round. Off, the ladder stops at lowered "
+            "effort; a run mode that requires thinking skips the step either way."
+        ),
+    )
 
  # ----- Death-spiral guard -----
     skip_terminal_hooks_on_llm_error: bool = Field(

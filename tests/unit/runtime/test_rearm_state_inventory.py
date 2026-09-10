@@ -54,6 +54,9 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_run_started_monotonic",
         "_run_started_epoch",
         "_run_settled_emitted",
+        # The knobs a cut retry turned down are put back by the round that
+        # follows; a turn opened elsewhere starts from the operator's values.
+        "_reasoning_cut_saved",
         "_tool_call_ledger",
         "_tool_call_ledger_seq",
         "_tool_call_ledger_truncated",

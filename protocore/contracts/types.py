@@ -220,6 +220,7 @@ SYNTHETIC_RECOVERY_MAX_OUTPUT_CONTINUE = "max_output_token_recovery"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for max-output resume user nudges."""
 
 SYNTHETIC_RECOVERY_THINKING_CONTINUE = "thinking_continue_prompt"
+SYNTHETIC_RECOVERY_REASONING_CUT = "reasoning_length_cut_nudge"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for thinking-only continue nudges."""
 
 SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY = "pre_terminal_self_verify"

@@ -180,7 +180,11 @@ class OutputCapRecoveryPolicy:
             turn.finish_reason in ("length", "")
             and not turn.pending_tool_calls
             and not turn.engine.stop_requested
+            and not (turn.reasoning_emitted and not turn.text_emitted)
         ):
+            # A round that is reasoning and nothing else is not cut mid-prose:
+            # there is no prose to resume, and the reasoning is not kept. The
+            # empty-model-turn policy answers for that round.
             # An empty finish reason is folded in here. Some providers end the
             # stream cleanly with no finish delta at all, and reading that as a
             # normal completion let a mid-sentence partial be persisted as the

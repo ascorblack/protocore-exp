@@ -126,6 +126,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
     SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
+    SYNTHETIC_RECOVERY_REASONING_CUT,
     SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     SYNTHETIC_RECOVERY_TERMINAL_TOOL_NUDGE,
     SYNTHETIC_RECOVERY_THINKING_CONTINUE,
@@ -316,6 +317,92 @@ def _append_thinking_continue_prompt(engine: QueryEngine) -> None:
                 SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_THINKING_CONTINUE
             },
         )
+    )
+
+
+def _step_reasoning_after_cut(engine: QueryEngine, round_: int) -> str | None:
+    """Turn one knob down for the retry after a reasoning-only length cut.
+
+    Round 1 lowers the effort to ``low``; round 2 switches thinking off. Each
+    step is skipped when it would change nothing, and a step the run mode
+    forbids (``deep`` keeps thinking on) is skipped the same way, so the value
+    returned says what the retry actually differs by — ``None`` when nothing
+    is left to change and the ladder is spent. The values as they stood before
+    the first step are kept for :func:`_restore_reasoning_after_cut`.
+    """
+    if engine._reasoning_cut_saved is None:
+        engine._reasoning_cut_saved = (
+            engine._live_thinking_enabled,
+            engine._live_reasoning_effort,
+        )
+    # The ladder is laid out from where the knobs stood BEFORE the first
+    # step, so the second round finds its step where the first left it.
+    saved_thinking, saved_effort = engine._reasoning_cut_saved
+    thinking = engine.config.thinking_enabled if saved_thinking is None else saved_thinking
+    effort = saved_effort or engine.config.reasoning_effort
+    steps: list[tuple[str, Callable[[], None]]] = []
+    if thinking and effort != "low":
+        steps.append(
+            ("reasoning_effort=low", partial(engine.apply_live_controls, reasoning_effort="low"))
+        )
+    if (
+        thinking
+        and engine.config.rc.reasoning_length_cut_disable_thinking
+        and engine.config.run_mode != "deep"
+    ):
+        steps.append(
+            ("thinking=off", partial(engine.apply_live_controls, thinking_enabled=False))
+        )
+    if round_ < 1 or round_ > len(steps):
+        return None
+    name, step = steps[round_ - 1]
+    step()
+    return name
+
+
+def _restore_reasoning_after_cut(engine: QueryEngine) -> None:
+    """Put thinking and effort back after the retries a cut round started."""
+    saved = engine._reasoning_cut_saved
+    if saved is None:
+        return
+    engine._live_thinking_enabled, engine._live_reasoning_effort = saved
+    engine._reasoning_cut_saved = None
+
+
+def _append_reasoning_cut_nudge(engine: QueryEngine) -> None:
+    """Name the cut and ask for a shorter shape; the cut reasoning is not kept."""
+    engine.history.append(
+        Message(
+            role=MessageRole.user,
+            content_blocks=[
+                TextBlock(text=engine.config.rc.reasoning_length_cut_nudge_text)
+            ],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_REASONING_CUT},
+        )
+    )
+
+
+def _policy_reasoning_cut_event(
+    engine: QueryEngine, round_: int, changed: str, reasoning_chars: int
+) -> TurnEvent:
+    """Say a cut retry is going out, what it changed, and what the cut round cost."""
+    _logger.warning(
+        "reasoning-only length cut: %s chars of reasoning and no answer; retry %s with %s",
+        reasoning_chars,
+        round_,
+        changed,
+    )
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload={
+            "from": engine.state.value,
+            "to": engine.state.value,
+            "reason": "reasoning_length_cut_retry",
+            "round": round_,
+            "changed": changed,
+            "reasoning_content_chars": reasoning_chars,
+        },
     )
 
 
@@ -3184,6 +3271,8 @@ async def _stream_one_assistant_message(
                 TurnCoordinate.output_truncated,
                 pending_tool_calls=stream_result.tool_calls,
                 finish_reason=stream_result.finish_reason or "",
+                text_emitted=bool(stream_result.text_buffer),
+                reasoning_emitted=bool(stream_result.reasoning_buffer),
                 record_partial_attempt=partial(
                     _persist_partial_attempt_to_history, engine, stream_result
                 ),
@@ -3280,6 +3369,7 @@ async def _stream_one_assistant_message(
             reasoning_chars=len(reasoning_buffer),
             tool_calls_pending=bool(pending_tool_calls),
             tool_results_ready=tool_results_ready_at is not None,
+            finish_reason=stream_result.finish_reason,
             record_partial_attempt=partial(
                 _persist_partial_attempt_to_history, engine, stream_result
             ),
@@ -11716,6 +11806,10 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             append_continue_prompt=_append_thinking_continue_prompt,
             append_post_tool_nudge=_append_post_tool_empty_nudge,
             continue_prompt_event=_policy_continue_prompt_event,
+            cut_step=_step_reasoning_after_cut,
+            cut_restore=_restore_reasoning_after_cut,
+            append_cut_nudge=_append_reasoning_cut_nudge,
+            cut_retry_event=_policy_reasoning_cut_event,
             enter_wind_down=_enter_soft_stop,
             wind_down_budget=_soft_stop_turn_budget,
             llm_terminal=_emit_llm_terminal,

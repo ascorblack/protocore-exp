@@ -1084,6 +1084,10 @@ class QueryEngine:
         self._live_model_name: str | None = None
         self._live_thinking_enabled: bool | None = None
         self._live_reasoning_effort: str | None = None
+        # The live thinking and effort as they stood before a retry after a
+        # reasoning-only length cut turned them down; ``None`` while no retry
+        # is out. The next round that produces anything puts them back.
+        self._reasoning_cut_saved: tuple[bool | None, str | None] | None = None
         self._run_settled_emitted: bool = False
 
         # Ordered record of the tool calls this run DISPATCHED. Written at the
