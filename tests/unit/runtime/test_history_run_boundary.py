@@ -309,7 +309,7 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "costs what it costs, seeded or not, so the whole view is what has to "
         "be measured"
     ),
-    "protocore/runtime/stale_result_trim.py::_calls_of_the_turn_in_flight": _whole(
+    "protocore/runtime/stale_result_trim.py::_calls_of_the_latest_round": _whole(
         "prompt assembly over the outbound view it is handed: finds the last "
         "message in it carrying tool calls, so the results answering that "
         "batch can be left whole. A later message cannot be shadowed by an "

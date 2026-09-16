@@ -12,13 +12,15 @@ cut, say how to get the rest back.
 
 Three properties are what make it safe to leave on:
 
-*Age, not size alone.* The newest :attr:`~LoopConstants.tool_result_fresh_count`
-results are never touched, however long they are, and neither is any result
-belonging to the turn in flight — every call made since the last message that
-opened a turn, however many rounds that turn has run. A result the run is still
-assembling an answer from is never the result this shortens, which is the bug a
-size-only rule has and the reason the split projection is not simply turned up.
-Only a turn the run has finished answering can lose anything.
+*Age, not size alone.* Two things are never touched, however long they are: the
+newest :attr:`~LoopConstants.tool_result_fresh_count` results, and every result
+of the latest round — the last batch of tool calls in the view together with the
+results answering it. That is the unit the model is about to read, and cutting
+inside it is the bug a size-only rule has, and the reason the split projection
+is not simply turned up. Everything older is eligible, including earlier rounds
+of the run in flight: a run that reads twenty files to answer one question is
+exactly the run this is for, and the first of those files is not what its answer
+is being written from any more.
 
 *Batches, not drips.* Every rewrite of the view changes the prompt prefix, and a
 changed prefix is a cache miss on the whole request. Trimming one result per turn
@@ -43,13 +45,7 @@ from collections.abc import Iterable, Sequence
 from protocore.contracts.prompts import IPromptTemplateProvider
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRoleMap
-from protocore.contracts.types import (
-    ContentBlock,
-    Message,
-    MessageRole,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from protocore.contracts.types import ContentBlock, Message, ToolResultBlock, ToolUseBlock
 from protocore.runtime.result_eviction import (
     is_compacted_placeholder,
     is_pinned_result,
@@ -57,31 +53,25 @@ from protocore.runtime.result_eviction import (
 )
 
 
-def _calls_of_the_turn_in_flight(history: Sequence[Message]) -> frozenset[str]:
-    """The call ids of every tool call made since the turn in flight opened.
+def _calls_of_the_latest_round(history: Sequence[Message]) -> frozenset[str]:
+    """The call ids of the last batch of tool calls in the view.
 
-    "In flight" is read off the transcript rather than remembered. Walking back
-    from the end, a user message that carries something other than tool results
-    is the message that opened the current turn; every call after it belongs to
-    that turn — the first of seven reads as much as the seventh. The fresh
-    window alone does not cover this: a turn that runs more rounds than
-    :attr:`~LoopConstants.tool_result_fresh_count` would otherwise have its own
-    earlier results cut while it is still writing the answer they are for.
-
-    A view with no such message is one long turn, and all of it is in flight.
+    The round is read off the transcript rather than remembered: the last
+    message carrying tool calls is the batch the model has just made, and a
+    result answering one of those calls is being read right now even when the
+    fresh window has already filled up with the rest of the batch. Earlier
+    rounds of the same run are not protected by this — the fresh window is what
+    covers them, and past it the run has moved on.
     """
-    ids: set[str] = set()
     for message in reversed(history):
-        ids.update(
+        ids = [
             block.tool_call_id
             for block in message.content_blocks
             if isinstance(block, ToolUseBlock)
-        )
-        if message.role is MessageRole.user and not any(
-            isinstance(block, ToolResultBlock) for block in message.content_blocks
-        ):
-            break
-    return frozenset(ids)
+        ]
+        if ids:
+            return frozenset(ids)
+    return frozenset()
 
 
 def _pointer(prompts: IPromptTemplateProvider, dropped: int, fresh_count: int) -> str:
@@ -119,7 +109,7 @@ def trim_stale_results(
     #: untouched whichever way the deployment set them.
     split_limit = rc.tool_result_content_max_chars if rc.tool_result_split_enabled else None
     pinned = set(pinned_ids)
-    in_flight = _calls_of_the_turn_in_flight(history)
+    latest_round = _calls_of_the_latest_round(history)
 
     #: Every result the view carries, in transcript order. Compacted
     #: placeholders are not results any more — the value they stood for is
@@ -158,7 +148,7 @@ def trim_stale_results(
         if block.tool_call_id in sticky:
             to_trim.add(block.tool_call_id)
             continue
-        if block.tool_call_id in fresh or block.tool_call_id in in_flight:
+        if block.tool_call_id in fresh or block.tool_call_id in latest_round:
             continue
         new_excess += len(block.content) - limit
         to_trim.add(block.tool_call_id)

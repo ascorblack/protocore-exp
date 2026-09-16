@@ -53,18 +53,10 @@ def _results(view: list[Message]) -> dict[str, ToolResultBlock]:
     }
 
 
-def _turn(call_id: str, size: int) -> list[Message]:
-    """A whole turn: the operator asks, one call goes out, one result answers it."""
-    return [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="and now this")]),
-        *_pair(call_id, size),
-    ]
-
-
 def _transcript(count: int, size: int = 900, prefix: str = "call") -> list[Message]:
     history: list[Message] = []
     for index in range(count):
-        history.extend(_turn(f"{prefix}_{index}", size))
+        history.extend(_pair(f"{prefix}_{index}", size))
     return history
 
 
@@ -158,7 +150,7 @@ def test_a_compacted_placeholder_is_never_rewritten() -> None:
     assert _results(view)["folded"].content == placeholder
 
 
-def test_the_batch_in_flight_is_never_cut() -> None:
+def test_the_latest_round_is_never_cut() -> None:
     # Three calls issued together; the fresh window holds only two of them, and
     # the third is still an answer the model is reading right now.
     history = _transcript(4)
@@ -180,27 +172,57 @@ def test_the_batch_in_flight_is_never_cut() -> None:
             )
         )
     _, trimmed = trim_stale_results(history, _rc(), PROMPTS)
-    # call_3 belongs to the same turn as the batch — the operator has not
-    # spoken since — so it is exempt too, outside the fresh window as it is.
-    assert trimmed == {"call_0", "call_1", "call_2"}
+    assert trimmed == {"call_0", "call_1", "call_2", "call_3"}
 
 
-def test_a_turn_of_many_rounds_keeps_every_result_it_made() -> None:
-    # One question, ten sequential reads of a large file. The fresh window is
-    # six; the other four are still this turn's own work, and an answer is
-    # still being written from them.
+def _long_run() -> list[Message]:
+    """One question answered by ten sequential rounds of a 20 KB read."""
     history: list[Message] = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="one question")])
     ]
     for index in range(10):
         history.extend(_pair(f"round_{index}", 20_000))
+    return history
+
+
+def test_a_run_of_many_rounds_keeps_its_latest_round_and_its_fresh_window() -> None:
+    # Below the batch threshold nothing moves at all, and what the guarantee
+    # names — the latest round, and the newest six results — is carried whole.
     view, trimmed = trim_stale_results(
-        history,
-        LoopConstants(tool_result_stale_trim_enabled=True),
+        _long_run(),
+        LoopConstants(
+            tool_result_stale_trim_enabled=True,
+            tool_result_stale_trim_batch_chars=100_000,
+        ),
         PROMPTS,
     )
     assert trimmed == frozenset()
-    assert view == list(history)
+    results = _results(view)
+    for index in range(4, 10):  # the fresh six, the last of them the latest round
+        assert results[f"round_{index}"].content == "x" * 20_000
+
+
+def test_the_older_rounds_of_the_same_run_go_once_the_batch_is_worth_it() -> None:
+    # The run this is for: one question, twenty files read, the window filling
+    # up. Past the fresh seven the run has moved on, and 54_000 characters of
+    # excess is worth the changed prefix.
+    view, trimmed = trim_stale_results(
+        _long_run(),
+        LoopConstants(
+            tool_result_stale_trim_enabled=True,
+            tool_result_fresh_count=7,
+            tool_result_stale_max_chars=2000,
+            tool_result_stale_trim_batch_chars=40_000,
+        ),
+        PROMPTS,
+    )
+    assert sorted(trimmed) == ["round_0", "round_1", "round_2"]
+    results = _results(view)
+    for index in range(3):
+        assert results[f"round_{index}"].content.startswith("x" * 2000)
+        assert "call the tool again" in results[f"round_{index}"].content
+    for index in range(3, 10):
+        assert results[f"round_{index}"].content == "x" * 20_000
 
 
 def test_a_sticky_id_the_view_no_longer_carries_is_forgotten() -> None:
@@ -208,7 +230,7 @@ def test_a_sticky_id_the_view_no_longer_carries_is_forgotten() -> None:
     _, trimmed = trim_stale_results(history, _rc(), PROMPTS)
     # The checkpoint dropped the oldest turn; its id must not ride along in
     # the set the engine keeps and every snapshot writes.
-    _, still = trim_stale_results(history[3:], _rc(), PROMPTS, already_trimmed=trimmed)
+    _, still = trim_stale_results(history[2:], _rc(), PROMPTS, already_trimmed=trimmed)
     assert "call_0" not in still
     assert "call_1" in still
 
