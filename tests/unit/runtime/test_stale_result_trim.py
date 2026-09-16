@@ -12,6 +12,7 @@ from protocore.contracts.types import (
 )
 from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.stale_result_trim import trim_stale_results
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 PROMPTS = bundled_prompt_provider()
 
@@ -190,3 +191,55 @@ def test_prose_blocks_are_carried_through_untouched() -> None:
     ]
     view, _ = trim_stale_results(history, _rc(), PROMPTS)
     assert view[0] is history[0]
+
+
+def test_a_pin_the_run_has_since_falsified_is_cut_like_any_other() -> None:
+    # The pinned read describes a file the run rewrote two calls later. Holding
+    # it whole keeps the version before the write in front of the model, which
+    # is worse than handing back its head and saying to read the file again.
+    history = [
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(
+                    tool_call_id="read", name="Read", arguments_json='{"path": "a.py"}'
+                )
+            ],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="read", content="x" * 900, path="a.py")
+            ],
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(
+                    tool_call_id="write", name="Write", arguments_json='{"path": "a.py"}'
+                )
+            ],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[ToolResultBlock(tool_call_id="write", content="written")],
+        ),
+        *_transcript(4),
+    ]
+    kept, _ = trim_stale_results(history, _rc(), PROMPTS, pinned_ids={"read"})
+    assert _results(kept)["read"].content == "x" * 900
+
+    cut, trimmed = trim_stale_results(
+        history, _rc(), PROMPTS, pinned_ids={"read"}, roles=CONVENTIONAL_TOOL_ROLES
+    )
+    assert "read" in trimmed
+    assert "call the tool again" in _results(cut)["read"].content
+
+
+def test_a_pin_over_a_file_nothing_rewrote_survives_the_roles_being_declared() -> None:
+    history = _pair("kept", 900, path="untouched.py") + _transcript(4)
+    view, trimmed = trim_stale_results(
+        history, _rc(), PROMPTS, pinned_ids={"kept"}, roles=CONVENTIONAL_TOOL_ROLES
+    )
+    assert "kept" not in trimmed
+    assert _results(view)["kept"].content == "x" * 900

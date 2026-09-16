@@ -40,8 +40,13 @@ from collections.abc import Iterable, Sequence
 
 from protocore.contracts.prompts import IPromptTemplateProvider
 from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRoleMap
 from protocore.contracts.types import ContentBlock, Message, ToolResultBlock, ToolUseBlock
-from protocore.runtime.result_eviction import is_compacted_placeholder, is_pinned_result
+from protocore.runtime.result_eviction import (
+    is_compacted_placeholder,
+    is_pinned_result,
+    pins_invalidated_by_writes,
+)
 
 
 def _calls_of_the_turn_in_flight(history: Sequence[Message]) -> frozenset[str]:
@@ -70,6 +75,7 @@ def trim_stale_results(
     *,
     pinned_ids: Iterable[str] = (),
     already_trimmed: Iterable[str] = (),
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> tuple[list[Message], frozenset[str]]:
     """Return the view with stale oversized results cut to their head.
 
@@ -100,13 +106,25 @@ def trim_stale_results(
 
     to_trim: set[str] = set()
     new_excess = 0
+    #: Computed on first need and then reused. The question only arises for a
+    #: result that is BOTH pinned and oversized, and the answer costs a pass
+    #: over the transcript, so a run with no such result never pays for it.
+    invalidated: frozenset[str] | None = None
     for block in results:
         if len(block.content) <= limit:
             continue
         # A pin is a standing request to keep this result in front of the
-        # model. It outranks age: the run said this one is the exception.
+        # model. It outranks age: the run said this one is the exception —
+        # unless the run has since rewritten the file the result describes, in
+        # which case the pin is holding a page that is no longer true and
+        # cutting it to its head is the kinder answer.
         if is_pinned_result(block, pinned, keep_marked=True):
-            continue
+            if invalidated is None:
+                invalidated = pins_invalidated_by_writes(history, roles=roles)
+            if is_pinned_result(
+                block, pinned, keep_marked=True, invalidated_ids=invalidated
+            ):
+                continue
         if block.tool_call_id in sticky:
             to_trim.add(block.tool_call_id)
             continue

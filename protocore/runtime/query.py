@@ -1012,6 +1012,7 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
             engine.prompt_provider,
             pinned_ids=engine._pinned_tool_result_ids,
             already_trimmed=engine._trimmed_tool_result_ids,
+            roles=engine.config.tool_roles,
         )
     if engine.config.rc.tool_result_split_enabled:
         from protocore.contracts.types import ToolResultBlock
