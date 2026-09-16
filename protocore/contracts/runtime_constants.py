@@ -2809,6 +2809,46 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Maximum characters of tool result content sent to the next LLM request.",
     )
+    tool_result_stale_trim_enabled: bool = Field(
+        default=False,
+        description=(
+            "When true, a tool result the run has moved past is cut to its "
+            "head in the next LLM request, with a line saying how much went "
+            "and that the tool can be called again. Age-aware, unlike "
+            "``tool_result_split_enabled``: the newest results and the batch "
+            "in flight are never touched. Persist keeps the full result. Off "
+            "by default."
+        ),
+    )
+    tool_result_fresh_count: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "How many of the newest tool results stale-trimming leaves alone, "
+            "however long they are. This is the window in which the model is "
+            "still working from what it read, so cutting inside it takes away "
+            "the result the run is about to use."
+        ),
+    )
+    tool_result_stale_max_chars: int = Field(
+        default=2000,
+        gt=0,
+        description=(
+            "Head kept of a tool result stale-trimming cuts. A result shorter "
+            "than this is never cut: there is nothing to win."
+        ),
+    )
+    tool_result_stale_trim_batch_chars: int = Field(
+        default=40000,
+        ge=0,
+        description=(
+            "How much trimmable excess must stand in the view before stale-"
+            "trimming does anything. Every trim changes the prompt prefix and "
+            "so costs a cache miss on the whole request, which is worth paying "
+            "for a batch of results and not for one — so the rule waits until "
+            "there is a batch."
+        ),
+    )
 
     # ----- Intent, ledger, session tree, lanes (all default off) -----
     intent_settlement_enabled: bool = Field(

@@ -99,6 +99,7 @@ BUNDLED_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
         "tool_result_interrupted": "tool_result_interrupted.j2",
         "tool_result_pairing_repair": "tool_result_pairing_repair.j2",
         "result_eviction": "result_eviction.j2",
+        "result_stale_trim": "result_stale_trim.j2",
         "compaction_turn_summary": "compaction_turn_summary.j2",
         "compaction_fold_summary": "compaction_fold_summary.j2",
     }

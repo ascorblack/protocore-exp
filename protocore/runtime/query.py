@@ -206,6 +206,7 @@ from protocore.runtime.skill_index import (
     derive_skill_index_budget_tokens,
     render_skills_catalog,
 )
+from protocore.runtime.stale_result_trim import trim_stale_results
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import argument_names, string_argument
@@ -1000,6 +1001,18 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
         roles=engine.config.tool_roles,
     )
     view = apply_checkpoint(view, getattr(engine, "compact_checkpoint", None))
+    if engine.config.rc.tool_result_stale_trim_enabled:
+        # After the checkpoint, so a compacted head is already a summary and
+        # cannot be cut twice; before the split, so a result this shortened is
+        # already under the split's limit and passes through it untouched. The
+        # decision is sticky, and the engine is where it is kept.
+        view, engine._trimmed_tool_result_ids = trim_stale_results(
+            view,
+            engine.config.rc,
+            engine.prompt_provider,
+            pinned_ids=engine._pinned_tool_result_ids,
+            already_trimmed=engine._trimmed_tool_result_ids,
+        )
     if engine.config.rc.tool_result_split_enabled:
         from protocore.contracts.types import ToolResultBlock
         from protocore.runtime.tool_result_split import project_result_content

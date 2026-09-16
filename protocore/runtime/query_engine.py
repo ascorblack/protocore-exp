@@ -727,6 +727,11 @@ class QueryEngine:
             "last_observed_prompt_tokens",
             "last_heartbeat_ms",
             "_pinned_tool_result_ids",
+            # The results this run has already cut down for the outbound view.
+            # A turn boundary may not forget them: forgetting one puts the whole
+            # result back in the next request and moves the prompt prefix for
+            # nothing.
+            "_trimmed_tool_result_ids",
             "_skill_catalog_block",
             # The digest the run's catalog block had before it was picked up,
             # kept until the new process rebuilds one and can be compared
@@ -1077,6 +1082,7 @@ class QueryEngine:
         # Live-run guardrails / interaction. Default-empty so a snapshot
         # taken before these fields existed resumes with prior behaviour.
         self._pinned_tool_result_ids: set[str] = set()
+        self._trimmed_tool_result_ids: frozenset[str] = frozenset()
         self._identical_tool_counts: dict[str, int] = {}
         self._loop_guard_nudge_count: int = 0
         self._steer_queue: list[dict[str, Any]] = []
@@ -2594,6 +2600,7 @@ class QueryEngine:
             # re-dispatches the synthetic run-end FinalizeFile.
             "longfile_voluntary_seal_used": self._longfile_voluntary_seal_used,
             "pinned_tool_result_ids": sorted(self._pinned_tool_result_ids),
+            "trimmed_tool_result_ids": sorted(self._trimmed_tool_result_ids),
             "identical_tool_counts": dict(self._identical_tool_counts),
             "loop_guard_nudge_count": self._loop_guard_nudge_count,
             "steer_queue": list(self._steer_queue),
@@ -3236,6 +3243,12 @@ class QueryEngine:
             {str(x) for x in restored_pins if isinstance(x, str)}
             if isinstance(restored_pins, list)
             else set()
+        )
+        restored_trims = snapshot.get("trimmed_tool_result_ids")
+        self._trimmed_tool_result_ids = (
+            frozenset(str(x) for x in restored_trims if isinstance(x, str))
+            if isinstance(restored_trims, list)
+            else frozenset()
         )
         restored_ident = snapshot.get("identical_tool_counts")
         self._identical_tool_counts = (
