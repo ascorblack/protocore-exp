@@ -1003,8 +1003,9 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
     view = apply_checkpoint(view, getattr(engine, "compact_checkpoint", None))
     if engine.config.rc.tool_result_stale_trim_enabled:
         # After the checkpoint, so a compacted head is already a summary and
-        # cannot be cut twice; before the split, so a result this shortened is
-        # already under the split's limit and passes through it untouched. The
+        # cannot be cut twice; before the split, which the trimmer knows and
+        # keeps a shortened result under the split's own limit for, so it
+        # passes through untouched whichever way the two limits are set. The
         # decision is sticky, and the engine is where it is kept.
         view, engine._trimmed_tool_result_ids = trim_stale_results(
             view,

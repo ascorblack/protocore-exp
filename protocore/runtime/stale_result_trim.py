@@ -13,10 +13,12 @@ cut, say how to get the rest back.
 Three properties are what make it safe to leave on:
 
 *Age, not size alone.* The newest :attr:`~LoopConstants.tool_result_fresh_count`
-results are never touched, however long they are, and neither is a result
-answering a call from the turn in flight. The result the model is about to use
-is never the result this shortens — which is the bug a size-only rule has, and
-the reason the split projection is not simply turned up.
+results are never touched, however long they are, and neither is any result
+belonging to the turn in flight — every call made since the last message that
+opened a turn, however many rounds that turn has run. A result the run is still
+assembling an answer from is never the result this shortens, which is the bug a
+size-only rule has and the reason the split projection is not simply turned up.
+Only a turn the run has finished answering can lose anything.
 
 *Batches, not drips.* Every rewrite of the view changes the prompt prefix, and a
 changed prefix is a cache miss on the whole request. Trimming one result per turn
@@ -41,7 +43,13 @@ from collections.abc import Iterable, Sequence
 from protocore.contracts.prompts import IPromptTemplateProvider
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRoleMap
-from protocore.contracts.types import ContentBlock, Message, ToolResultBlock, ToolUseBlock
+from protocore.contracts.types import (
+    ContentBlock,
+    Message,
+    MessageRole,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from protocore.runtime.result_eviction import (
     is_compacted_placeholder,
     is_pinned_result,
@@ -50,22 +58,37 @@ from protocore.runtime.result_eviction import (
 
 
 def _calls_of_the_turn_in_flight(history: Sequence[Message]) -> frozenset[str]:
-    """The call ids of the last batch of tool calls in the view.
+    """The call ids of every tool call made since the turn in flight opened.
 
-    "In flight" is read off the transcript rather than remembered: the last
-    message carrying tool calls is the batch the run is working through, and a
-    result answering one of those calls is being read right now even when the
-    fresh window has already filled up with the rest of the batch.
+    "In flight" is read off the transcript rather than remembered. Walking back
+    from the end, a user message that carries something other than tool results
+    is the message that opened the current turn; every call after it belongs to
+    that turn — the first of seven reads as much as the seventh. The fresh
+    window alone does not cover this: a turn that runs more rounds than
+    :attr:`~LoopConstants.tool_result_fresh_count` would otherwise have its own
+    earlier results cut while it is still writing the answer they are for.
+
+    A view with no such message is one long turn, and all of it is in flight.
     """
+    ids: set[str] = set()
     for message in reversed(history):
-        ids = [
+        ids.update(
             block.tool_call_id
             for block in message.content_blocks
             if isinstance(block, ToolUseBlock)
-        ]
-        if ids:
-            return frozenset(ids)
-    return frozenset()
+        )
+        if message.role is MessageRole.user and not any(
+            isinstance(block, ToolResultBlock) for block in message.content_blocks
+        ):
+            break
+    return frozenset(ids)
+
+
+def _pointer(prompts: IPromptTemplateProvider, dropped: int, fresh_count: int) -> str:
+    """The line that replaces what was cut: how much went and how to get it back."""
+    return prompts.render(
+        "result_stale_trim", {"dropped_chars": dropped, "fresh_count": fresh_count}
+    )
 
 
 def trim_stale_results(
@@ -88,6 +111,13 @@ def trim_stale_results(
         return list(history), sticky
 
     limit = rc.tool_result_stale_max_chars
+    #: The split projection runs over this same view immediately after the trim
+    #: (:func:`protocore.runtime.query._llm_history`) and cuts at a limit of its
+    #: own, appending its own pointer over the one written here. The two are
+    #: independent knobs — nothing orders them — so when both are on, a
+    #: shortened result is kept under the split's limit and passes through it
+    #: untouched whichever way the deployment set them.
+    split_limit = rc.tool_result_content_max_chars if rc.tool_result_split_enabled else None
     pinned = set(pinned_ids)
     in_flight = _calls_of_the_turn_in_flight(history)
 
@@ -137,6 +167,12 @@ def trim_stale_results(
         # Not enough to pay for the changed prefix. Whatever was already cut
         # stays cut; nothing new joins it this build.
         to_trim &= sticky
+    #: Only ids the view still carries stay sticky. A result compaction has
+    #: since replaced with a placeholder, or a checkpoint dropped entirely, is
+    #: never coming back whole, so remembering it only grows the set the engine
+    #: holds and every snapshot written from it.
+    present = frozenset(block.tool_call_id for block in results)
+    sticky &= present
     if not to_trim:
         return list(history), sticky
 
@@ -148,15 +184,18 @@ def trim_stale_results(
             if not isinstance(existing, ToolResultBlock) or existing.tool_call_id not in to_trim:
                 new_blocks.append(existing)
                 continue
-            dropped = len(existing.content) - limit
-            pointer = prompts.render(
-                "result_stale_trim",
-                {"dropped_chars": dropped, "fresh_count": fresh_count},
-            )
+            head = limit
+            pointer = _pointer(prompts, len(existing.content) - head, fresh_count)
+            if split_limit is not None and head + 1 + len(pointer) > split_limit:
+                # Size the head against the longest the pointer can become:
+                # cutting more only ever adds digits to the number it names.
+                widest = _pointer(prompts, len(existing.content), fresh_count)
+                head = max(split_limit - len(widest) - 1, 0)
+                pointer = _pointer(prompts, len(existing.content) - head, fresh_count)
             new_blocks.append(
                 existing.model_copy(
                     update={
-                        "content": existing.content[:limit] + "\n" + pointer,
+                        "content": existing.content[:head] + "\n" + pointer,
                         "metadata": {**existing.metadata, "stale_trimmed": True},
                     }
                 )
@@ -165,7 +204,7 @@ def trim_stale_results(
         rewritten.append(
             message.model_copy(update={"content_blocks": new_blocks}) if changed else message
         )
-    return rewritten, sticky | to_trim
+    return rewritten, (sticky | to_trim) & present
 
 
 __all__ = ["trim_stale_results"]

@@ -2815,9 +2815,9 @@ class LoopConstants(BaseModel):
             "When true, a tool result the run has moved past is cut to its "
             "head in the next LLM request, with a line saying how much went "
             "and that the tool can be called again. Age-aware, unlike "
-            "``tool_result_split_enabled``: the newest results and the batch "
-            "in flight are never touched. Persist keeps the full result. Off "
-            "by default."
+            "``tool_result_split_enabled``: the newest results and every "
+            "result of the turn in flight are never touched. Persist keeps "
+            "the full result. Off by default."
         ),
     )
     tool_result_fresh_count: int = Field(
@@ -2825,9 +2825,10 @@ class LoopConstants(BaseModel):
         ge=0,
         description=(
             "How many of the newest tool results stale-trimming leaves alone, "
-            "however long they are. This is the window in which the model is "
-            "still working from what it read, so cutting inside it takes away "
-            "the result the run is about to use."
+            "however long they are, on top of the whole turn in flight, which "
+            "is exempt however many rounds it runs. This is the window in "
+            "which the model is still working from what it read, so cutting "
+            "inside it takes away the result the run is about to use."
         ),
     )
     tool_result_stale_max_chars: int = Field(

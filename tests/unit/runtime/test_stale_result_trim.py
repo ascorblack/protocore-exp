@@ -53,10 +53,18 @@ def _results(view: list[Message]) -> dict[str, ToolResultBlock]:
     }
 
 
+def _turn(call_id: str, size: int) -> list[Message]:
+    """A whole turn: the operator asks, one call goes out, one result answers it."""
+    return [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="and now this")]),
+        *_pair(call_id, size),
+    ]
+
+
 def _transcript(count: int, size: int = 900, prefix: str = "call") -> list[Message]:
     history: list[Message] = []
     for index in range(count):
-        history.extend(_pair(f"{prefix}_{index}", size))
+        history.extend(_turn(f"{prefix}_{index}", size))
     return history
 
 
@@ -151,8 +159,8 @@ def test_a_compacted_placeholder_is_never_rewritten() -> None:
 
 
 def test_the_batch_in_flight_is_never_cut() -> None:
-    # Two calls issued together; the fresh window holds only one of them, and
-    # the other is still the answer the model is reading right now.
+    # Three calls issued together; the fresh window holds only two of them, and
+    # the third is still an answer the model is reading right now.
     history = _transcript(4)
     history.append(
         Message(
@@ -172,7 +180,57 @@ def test_the_batch_in_flight_is_never_cut() -> None:
             )
         )
     _, trimmed = trim_stale_results(history, _rc(), PROMPTS)
-    assert trimmed == {"call_0", "call_1", "call_2", "call_3"}
+    # call_3 belongs to the same turn as the batch — the operator has not
+    # spoken since — so it is exempt too, outside the fresh window as it is.
+    assert trimmed == {"call_0", "call_1", "call_2"}
+
+
+def test_a_turn_of_many_rounds_keeps_every_result_it_made() -> None:
+    # One question, ten sequential reads of a large file. The fresh window is
+    # six; the other four are still this turn's own work, and an answer is
+    # still being written from them.
+    history: list[Message] = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="one question")])
+    ]
+    for index in range(10):
+        history.extend(_pair(f"round_{index}", 20_000))
+    view, trimmed = trim_stale_results(
+        history,
+        LoopConstants(tool_result_stale_trim_enabled=True),
+        PROMPTS,
+    )
+    assert trimmed == frozenset()
+    assert view == list(history)
+
+
+def test_a_sticky_id_the_view_no_longer_carries_is_forgotten() -> None:
+    history = _transcript(5)
+    _, trimmed = trim_stale_results(history, _rc(), PROMPTS)
+    # The checkpoint dropped the oldest turn; its id must not ride along in
+    # the set the engine keeps and every snapshot writes.
+    _, still = trim_stale_results(history[3:], _rc(), PROMPTS, already_trimmed=trimmed)
+    assert "call_0" not in still
+    assert "call_1" in still
+
+
+def test_a_trimmed_result_fits_the_split_that_runs_after_it() -> None:
+    # The two limits are independent: a deployment that keeps more head than
+    # the split allows would otherwise have the split cut the trim pointer in
+    # half, and the line saying how to get the result back with it.
+    history = _transcript(5, size=4000)
+    view, trimmed = trim_stale_results(
+        history,
+        _rc(
+            tool_result_stale_max_chars=3000,
+            tool_result_split_enabled=True,
+            tool_result_content_max_chars=500,
+        ),
+        PROMPTS,
+    )
+    assert "call_0" in trimmed
+    content = _results(view)["call_0"].content
+    assert len(content) <= 500
+    assert content.endswith("call the tool again if you need it]")
 
 
 def test_the_switch_off_leaves_the_view_alone() -> None:
