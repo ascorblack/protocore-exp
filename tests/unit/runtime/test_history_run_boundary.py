@@ -303,6 +303,11 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "all rewrite that outbound copy and leave persist untouched, so what "
         "this reads is the whole of what goes on the wire"
     ),
+    "protocore/runtime/history_persist.py::persist_history": _whole(
+        "hands the session store what changed in the session transcript: what "
+        "is persisted is the whole of what the session has said, because that "
+        "is what the next process reads back when it seeds an engine"
+    ),
     "protocore/runtime/stale_result_trim.py::trim_stale_results": _whole(
         "prompt assembly over the outbound view it is handed: cuts oversized "
         "tool results down to their head. Every result the request carries "

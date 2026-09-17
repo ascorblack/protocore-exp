@@ -80,6 +80,14 @@ _PROCESS_LOCAL: dict[str, str] = {
         "background_task_ids, which is the only witness a resumed run has that "
         "a command exists at all."
     ),
+    "_persisted_history": (
+        "the prefix the session store was handed, held as the message objects "
+        "themselves so that identity says whether the sequence grew or was "
+        "rewritten. Object identity does not survive a serialisation round "
+        "trip, and the process resuming the run has no way to know what the "
+        "store took from the process before it — so it starts empty and the "
+        "first hand-over after a resume writes the history whole."
+    ),
     "_resumed_skill_catalog_sha256": (
         "read OUT of the snapshot rather than written into it: it is the digest "
         "the catalog block had in the process that wrote the payload, held only "

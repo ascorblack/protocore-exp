@@ -160,6 +160,7 @@ from protocore.runtime.error_kinds import (
     # reports a run's terminal kind reads it from the driver it drives.
 )
 from protocore.runtime.events import BlockVisibility, EventType, TurnEvent
+from protocore.runtime.history_persist import persist_history
 from protocore.runtime.intent import (
     RESERVED,
     SETTLED,
@@ -1354,9 +1355,7 @@ async def _maybe_place_background_wakes(
             content_blocks=[TextBlock(text=text)],
         )
     )
-    persister = getattr(engine, "persist_session_history", None)
-    if callable(persister):
-        persister(engine)
+    persist_history(engine)
     return _BackgroundWakeOutcome(
         task_ids=tuple(ids), detached_reason=detached_reason
     )
@@ -2065,9 +2064,7 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     # Per-turn block index reset
     engine.reset_block_idx()
     engine.total_usage.reset_turn()
-    persister = getattr(engine, "persist_session_history", None)
-    if callable(persister):
-        persister(engine)
+    persist_history(engine)
     await _populate_discovered_rules(engine)
     # Before this turn drives anything, close out any call this run was in the
     # middle of when it last stopped. A run rehydrated on another pod has to
@@ -2115,9 +2112,7 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         )
         if ckpt is not None:
             engine.compact_checkpoint = ckpt
-            persister = getattr(engine, "persist_session_history", None)
-            if callable(persister):
-                persister(engine)
+            persist_history(engine)
             from protocore.runtime.correctness_bind import commit_usage
 
             usage_evt = commit_usage(

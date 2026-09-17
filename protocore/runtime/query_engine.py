@@ -721,6 +721,11 @@ class QueryEngine:
             # discovery pin LRU, which is the agent keeping the tools it went
             # looking for. Both are bounded, so neither grows without limit.
             "history",
+            # What the store already holds. A turn boundary is not a reason to
+            # believe the store forgot the session: cleared here, every turn
+            # would open by rewriting the whole history, which is the cost the
+            # marker exists to remove.
+            "_persisted_history",
             "compaction_state",
             "compact_checkpoint",
             "context_manager",
@@ -840,6 +845,11 @@ class QueryEngine:
 
         # Mutable per-conversation state
         self.history: list[Message] = []
+        # The prefix of ``history`` the session store has already been given.
+        # Read through ``persisted_history_prefix``; see
+        # ``protocore.runtime.history_persist`` for what it is compared against
+        # and why identity is the comparison.
+        self._persisted_history: tuple[Message, ...] | None = None
         self.state: LoopState = LoopState.PENDING
         self.compaction_state = CompactionState()
         self.total_usage = TokenUsage()
@@ -3533,6 +3543,35 @@ class QueryEngine:
 
     def history_snapshot(self) -> Sequence[Message]:
         return tuple(self.history)
+
+    @property
+    def persisted_history_prefix(self) -> tuple[Message, ...] | None:
+        """The messages the session store has already been handed, in order.
+
+        Held by reference rather than by value: the objects are the history's
+        own, so remembering them costs a pointer apiece and keeps nothing alive
+        that the history was not keeping alive.
+
+        ``None`` is not the same as empty. Empty is the store holding nothing
+        and being known to hold nothing; ``None`` is the store's copy being
+        unknown — a fresh engine, a run picked up on another process, a host
+        that said it dropped what it had — and the next hand-over is then a
+        full rewrite rather than an append onto rows nobody can vouch for.
+        """
+        return self._persisted_history
+
+    def note_history_persisted(self, history: tuple[Message, ...]) -> None:
+        """Record the prefix the store has now been given."""
+        self._persisted_history = history
+
+    def forget_persisted_history(self) -> None:
+        """Say that the store no longer holds what it was told it holds.
+
+        A host that evicted rows, moved the session to another store or
+        rebuilt its copy from somewhere else calls this; the next hand-over is
+        a full rewrite rather than an append onto rows that are gone.
+        """
+        self._persisted_history = None
 
     def new_tool_call_id(self) -> str:
         return f"toolu_{uuid.uuid4().hex[:12]}"
