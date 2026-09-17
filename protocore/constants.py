@@ -66,6 +66,12 @@ DEFAULT_MODEL: Final[str] = "qwen3.6-35b-a3b"
 # run carries, so a full re-estimate of that history never evicts its own head.
 MAX_TOKEN_ESTIMATE_CACHE_ENTRIES: Final[int] = 4096
 
+# How many distinct tool surfaces one process remembers — the digests, the
+# token estimates and which of them have been published in full. A deployment
+# advertises one surface, or a few where scopes differ; the bound is there so a
+# process that somehow meets a new surface per run does not accumulate them.
+MAX_TOOL_SURFACE_CACHE_ENTRIES: Final[int] = 8
+
 # Protocol version string surfaced in envelopes. Bumped whenever wire format breaks.
 PROTOCOL_VERSION: Final[str] = "2.0.0"
 
@@ -83,6 +89,7 @@ __all__ = [
     "MAX_TOKEN_ESTIMATE_CACHE_ENTRIES",
     "MAX_TOOL_CALL_ARGUMENT_BYTES",
     "MAX_TOOL_CALL_DETAILS",
+    "MAX_TOOL_SURFACE_CACHE_ENTRIES",
     "MAX_WARNINGS",
     "PROTOCOL_COMPACTED_TOOL_RESULT_V1",
     "PROTOCOL_VERSION",

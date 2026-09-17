@@ -209,7 +209,6 @@ from protocore.runtime.skill_index import (
 )
 from protocore.runtime.stale_result_trim import trim_stale_results
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
-from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
@@ -227,6 +226,11 @@ from protocore.runtime.tool_dispatch import (
     _record_tool_call_soft_cap_warning,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
+from protocore.runtime.tool_surface import (
+    claim_surface_publication,
+    read_tool_surface,
+    tool_surface_tokens,
+)
 from protocore.runtime.turn_policies import (
     RunCounter,
     TurnPolicyRegistry,
@@ -1662,6 +1666,17 @@ def _tool_surface_advertised_payload(
     scope that renamed its shell tool got a destructive command drawn as
     something harmless. The map is the host's answer to that question, so it is
     the thing to publish, rather than leaving every reader to guess again.
+
+    What each tool DOES, though, is the same answer on every run of a
+    deployment, and publishing it per run made a store of these events a store
+    of one description repeated: 36 KB apiece, and the descriptions were all of
+    it. So the surface is named by ``tool_surface_digest`` and the descriptions
+    travel with the first advertisement of a digest in this process;
+    ``tool_surface_described`` says which kind of advertisement this is, and a
+    reader keeps the descriptions against the digest and looks them up when
+    they are absent. What is run-specific — which tools are on the surface, why
+    each is there, what roles they carry — is in every advertisement, because
+    that is what changes.
     """
 
     policy = engine.effective_tool_policy
@@ -1669,7 +1684,9 @@ def _tool_surface_advertised_payload(
     toolsearch_pins = frozenset(engine.context_manager.pinned_tool_names())
     forced_pins = frozenset(policy.forced_pinned)
     configured_pins = frozenset(policy.pinned) - toolsearch_pins
-    tool_names = [tool.name for tool in context.tools]
+    surface = read_tool_surface(context.tools)
+    describe = claim_surface_publication(surface.digest)
+    tool_names = list(surface.names)
     tools: list[dict[str, object]] = []
     for tool in context.tools:
         sources: list[str] = []
@@ -1681,18 +1698,20 @@ def _tool_surface_advertised_payload(
             sources.append("forced_pin")
         if not sources:
             sources.append("retrieved_or_visible")
-        tools.append(
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "sources": sources,
-                "roles": sorted(role.value for role in roles.roles_of(tool.name)),
-            }
-        )
+        entry: dict[str, object] = {
+            "name": tool.name,
+            "sources": sources,
+            "roles": sorted(role.value for role in roles.roles_of(tool.name)),
+        }
+        if describe:
+            entry["description"] = tool.description
+        tools.append(entry)
     return {
         "turn_id": engine.turn_id(),
         "tool_count": len(tool_names),
         "tool_names": tool_names,
+        "tool_surface_digest": surface.digest,
+        "tool_surface_described": describe,
         "toolsearch_pinned_tool_names": sorted(toolsearch_pins),
         "configured_pinned_tool_names": sorted(configured_pins),
         "forced_pinned_tool_names": sorted(forced_pins),
@@ -5017,15 +5036,18 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     with does too: the messages as sent (system prompt included) and the tool
     definitions. Moves are damped, and a change too small to matter is not
     written, so the estimate cache is not invalidated on every call.
+
+    The tool definitions are not recomputed from nothing: they are costed once
+    per surface digest, which for a deployment whose registry is not changing
+    is once, rather than once per call for a number that could not have
+    changed.
     """
     rc = engine.config.rc
     if not rc.token_estimate_calibration_enabled or observed <= 0:
         return
     uncalibrated = rc.model_copy(update={"token_estimate_calibration": 1.0})
     raw = estimate_history_tokens(list(request.messages), uncalibrated)
-    for tool in request.tools:
-        dump = getattr(tool, "model_dump_json", None)
-        raw += estimate_tokens(dump() if dump is not None else str(tool), uncalibrated)
+    raw += tool_surface_tokens(read_tool_surface(request.tools), uncalibrated)
     if raw <= 0:
         return
     measured = min(max(observed / raw, 1.0), 4.0)
