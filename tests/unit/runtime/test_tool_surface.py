@@ -1,21 +1,27 @@
 """The advertised tool surface is named once and costed once."""
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import ToolDefinition, ToolParameterSchema
 from protocore.runtime import token_counting
 from protocore.runtime.tool_surface import (
-    claim_surface_publication,
     forget_tool_surfaces,
+    note_surface_described,
     read_tool_surface,
+    surface_descriptions,
+    surface_needs_describing,
     tool_surface_tokens,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clean_surfaces() -> None:
+def _clean_surfaces() -> Iterator[None]:
+    forget_tool_surfaces()
+    yield
     forget_tool_surfaces()
 
 
@@ -27,26 +33,7 @@ def _tool(name: str, description: str = "does a thing") -> ToolDefinition:
     )
 
 
-def test_the_same_definitions_are_serialised_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    tools = (_tool("read"), _tool("write"))
-    first = read_tool_surface(tools)
-
-    dumps = 0
-    original = ToolDefinition.model_dump_json
-
-    def counted(self: ToolDefinition, **kwargs: object) -> str:
-        nonlocal dumps
-        dumps += 1
-        return original(self, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(ToolDefinition, "model_dump_json", counted)
-    again = read_tool_surface(tools)
-
-    assert again is first
-    assert dumps == 0
-
-
-def test_equal_definitions_rebuilt_share_a_digest() -> None:
+def test_equal_definitions_share_a_digest() -> None:
     one = read_tool_surface((_tool("read"), _tool("write")))
     other = read_tool_surface((_tool("read"), _tool("write")))
 
@@ -60,6 +47,36 @@ def test_a_changed_description_changes_the_digest() -> None:
     other = read_tool_surface((_tool("read", "reads a file, or a range of it"),))
 
     assert other.digest != one.digest
+
+
+def test_a_schema_edited_in_place_changes_the_digest() -> None:
+    """ToolDefinition is frozen; the dict inside its schema is not.
+
+    A surface remembered against object identity would hand back a digest that
+    had stopped describing the tool. Nothing is remembered against identity, so
+    the edit is seen.
+    """
+    tool = ToolDefinition(
+        name="read",
+        description="reads",
+        parameters=ToolParameterSchema(properties={"a": {"type": "string"}}, required=[]),
+    )
+    first = read_tool_surface((tool,))
+    tool.parameters.properties["b"] = {"type": "integer"}
+    second = read_tool_surface((tool,))
+
+    assert second.digest != first.digest
+
+
+def test_a_definition_that_is_not_a_model_is_still_costed() -> None:
+    class _Bare:
+        name = "bare"
+        description = "not a pydantic model"
+
+    surface = read_tool_surface((_Bare(),))
+
+    assert surface.names == ("bare",)
+    assert tool_surface_tokens(surface, LoopConstants()) > 0
 
 
 def test_the_definitions_are_costed_once_per_digest(
@@ -104,9 +121,38 @@ def test_the_calibration_factor_does_not_change_the_definition_cost() -> None:
     assert scaled == plain
 
 
-def test_a_digest_is_published_in_full_once() -> None:
+def test_each_reader_is_described_the_surface_once() -> None:
     surface = read_tool_surface((_tool("read"),))
 
-    assert claim_surface_publication(surface.digest) is True
-    assert claim_surface_publication(surface.digest) is False
-    assert claim_surface_publication("a different surface") is True
+    assert surface_needs_describing(surface.digest, "session-a") is True
+    # Asking does not claim: an advertisement that was never delivered leaves
+    # the reader still owed its descriptions.
+    assert surface_needs_describing(surface.digest, "session-a") is True
+
+    note_surface_described(surface.digest, "session-a")
+
+    assert surface_needs_describing(surface.digest, "session-a") is False
+    # A second reader has been told nothing.
+    assert surface_needs_describing(surface.digest, "session-b") is True
+    # And a changed surface is described again, to everyone.
+    other = read_tool_surface((_tool("read", "reads, differently"),))
+    assert surface_needs_describing(other.digest, "session-a") is True
+
+
+def test_the_descriptions_can_be_looked_up_by_digest() -> None:
+    surface = read_tool_surface((_tool("read", "reads a file"), _tool("write")))
+
+    assert surface_descriptions(surface.digest) == {
+        "read": "reads a file",
+        "write": "does a thing",
+    }
+    assert surface_descriptions("a digest this process never read") is None
+
+
+def test_the_returned_descriptions_are_a_copy() -> None:
+    surface = read_tool_surface((_tool("read", "reads a file"),))
+    taken = surface_descriptions(surface.digest)
+    assert taken is not None
+    taken["read"] = "something else"
+
+    assert surface_descriptions(surface.digest) == {"read": "reads a file"}

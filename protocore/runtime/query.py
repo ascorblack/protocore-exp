@@ -227,8 +227,9 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_surface import (
-    claim_surface_publication,
+    note_surface_described,
     read_tool_surface,
+    surface_needs_describing,
     tool_surface_tokens,
 )
 from protocore.runtime.turn_policies import (
@@ -1652,10 +1653,20 @@ def _provider_call_category(engine: QueryEngine) -> str:
     return "agent_call"
 
 
+@dataclass(frozen=True)
+class _ToolSurfaceAdvert:
+    """One advertisement, and what claiming it would cost if it is delivered."""
+
+    payload: dict[str, object]
+    digest: str
+    audience: str
+    describes: bool
+
+
 def _tool_surface_advertised_payload(
     engine: QueryEngine,
     context: ContextBundle,
-) -> dict[str, object]:
+) -> _ToolSurfaceAdvert:
     """The exact tool list sent to the provider, and what each of those tools does.
 
     The roles ride along because the runtime is no longer the only reader that
@@ -1670,13 +1681,20 @@ def _tool_surface_advertised_payload(
     What each tool DOES, though, is the same answer on every run of a
     deployment, and publishing it per run made a store of these events a store
     of one description repeated: 36 KB apiece, and the descriptions were all of
-    it. So the surface is named by ``tool_surface_digest`` and the descriptions
-    travel with the first advertisement of a digest in this process;
-    ``tool_surface_described`` says which kind of advertisement this is, and a
-    reader keeps the descriptions against the digest and looks them up when
-    they are absent. What is run-specific — which tools are on the surface, why
-    each is there, what roles they carry — is in every advertisement, because
-    that is what changes.
+    it. So the surface is named by ``tool_surface_digest``, and the
+    descriptions travel with the first advertisement of that digest to reach
+    each reader — the session, which is the unit a host fans events out over,
+    so the runs of one session share one description and a client that
+    connected for a later session still gets its own.
+    ``tool_surface_described`` says which kind of advertisement this is; a
+    reader keeps the descriptions against the digest, looks them up when they
+    are absent, and can ask the host for them by digest if it has none. What is
+    run-specific — which tools are on the surface, why each is there, what
+    roles they carry — is in every advertisement, because that is what changes.
+
+    Nothing is claimed here. The advertisement says what it says, and the
+    caller records the claim once the event has actually been handed to the
+    stream.
     """
 
     policy = engine.effective_tool_policy
@@ -1685,7 +1703,8 @@ def _tool_surface_advertised_payload(
     forced_pins = frozenset(policy.forced_pinned)
     configured_pins = frozenset(policy.pinned) - toolsearch_pins
     surface = read_tool_surface(context.tools)
-    describe = claim_surface_publication(surface.digest)
+    audience = engine.config.session_id or engine.config.run_id
+    describe = surface_needs_describing(surface.digest, audience)
     tool_names = list(surface.names)
     tools: list[dict[str, object]] = []
     for tool in context.tools:
@@ -1706,7 +1725,7 @@ def _tool_surface_advertised_payload(
         if describe:
             entry["description"] = tool.description
         tools.append(entry)
-    return {
+    payload: dict[str, object] = {
         "turn_id": engine.turn_id(),
         "tool_count": len(tool_names),
         "tool_names": tool_names,
@@ -1722,6 +1741,12 @@ def _tool_surface_advertised_payload(
         },
         "tools": tools,
     }
+    return _ToolSurfaceAdvert(
+        payload=payload,
+        digest=surface.digest,
+        audience=audience,
+        describes=describe,
+    )
 
 
 async def resume(
@@ -4574,11 +4599,17 @@ async def _drive_one_stream(
                 else:
                     _pending_reads.charge_forced_attempt(engine)
                     forced_tool_choice = readback_tool
+    advert = _tool_surface_advertised_payload(engine, context)
     yield TurnEvent(
         type=EventType.TOOL_SURFACE_ADVERTISED,
         run_id=engine.config.run_id,
-        payload=_tool_surface_advertised_payload(engine, context),
+        payload=advert.payload,
     )
+    # Claimed only once the event has been handed to the stream. A run
+    # cancelled at that yield would otherwise have spent its reader's one
+    # description on an event nobody received.
+    if advert.describes:
+        note_surface_described(advert.digest, advert.audience)
     request = build_llm_request(
         model=engine.effective_model_name,
         messages=full_messages,
