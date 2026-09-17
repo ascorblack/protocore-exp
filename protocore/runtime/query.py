@@ -152,7 +152,7 @@ from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
     current_tool_batch_protect_index,
-    estimate_history_tokens,
+    estimate_history_tokens_uncalibrated,
 )
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.error_kinds import (
@@ -5037,17 +5037,18 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     definitions. Moves are damped, and a change too small to matter is not
     written, so the estimate cache is not invalidated on every call.
 
-    The tool definitions are not recomputed from nothing: they are costed once
-    per surface digest, which for a deployment whose registry is not changing
-    is once, rather than once per call for a number that could not have
-    changed.
+    Neither half of the raw estimate is recomputed from nothing. The messages
+    are read through the same per-message cache the calibrated readings use —
+    the factor is a multiplier applied where the number is handed out, so the
+    two readings share entries instead of evicting each other — and the tool
+    definitions are costed once per surface digest, which for a deployment
+    whose registry is not changing is once.
     """
     rc = engine.config.rc
     if not rc.token_estimate_calibration_enabled or observed <= 0:
         return
-    uncalibrated = rc.model_copy(update={"token_estimate_calibration": 1.0})
-    raw = estimate_history_tokens(list(request.messages), uncalibrated)
-    raw += tool_surface_tokens(read_tool_surface(request.tools), uncalibrated)
+    raw = estimate_history_tokens_uncalibrated(list(request.messages), rc)
+    raw += tool_surface_tokens(read_tool_surface(request.tools), rc)
     if raw <= 0:
         return
     measured = min(max(observed / raw, 1.0), 4.0)

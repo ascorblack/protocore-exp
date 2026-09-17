@@ -21,6 +21,7 @@ from protocore.contracts.types import ImageRefBlock, Message, MessageRole, TextB
 from protocore.runtime.context.compaction import (
     TokenEstimator,
     estimate_history_tokens,
+    estimate_history_tokens_uncalibrated,
     estimate_message_tokens,
 )
 
@@ -153,6 +154,43 @@ def test_changed_tuning_is_not_answered_from_the_cache() -> None:
     assert before != after
     assert after == estimator.estimate_history(history, retuned)
     assert before == estimator.estimate_history(history, baseline)
+
+
+def test_the_calibration_factor_scales_an_answer_it_does_not_evict() -> None:
+    """The calibrator's pass and the loop's must not evict each other.
+
+    The factor is a multiplier over the whole partition, so an estimate made
+    under one value answers for any other. Keying the cache on it split every
+    history in two: the calibrator sizes the request uncalibrated to compare it
+    against what the provider reported, and each pass threw away what the pass
+    before it had paid for.
+    """
+    history = _history("calibrated", length=8)
+    estimator = TokenEstimator()
+
+    plain = LoopConstants(token_estimate_calibration=1.0)
+    scaled = LoopConstants(token_estimate_calibration=1.5)
+
+    raw = estimator.estimate_history_uncalibrated(history, plain)
+    entries = len(estimator)
+    calibrated = estimator.estimate_history(history, scaled)
+
+    assert len(estimator) == entries
+    assert raw == estimator.estimate_history(history, plain)
+    assert calibrated == sum(
+        round(estimator.estimate_message(message, plain) * 1.5) for message in history
+    )
+    assert calibrated > raw
+
+
+def test_the_module_level_uncalibrated_reading_agrees_with_an_owned_estimator() -> None:
+    history = _history("module-uncalibrated", length=6)
+    estimator = TokenEstimator()
+    rc = LoopConstants(token_estimate_calibration=1.3)
+
+    assert estimate_history_tokens_uncalibrated(
+        history, rc
+    ) == estimator.estimate_history_uncalibrated(history, rc)
 
 
 def test_image_token_tuning_is_part_of_the_key() -> None:

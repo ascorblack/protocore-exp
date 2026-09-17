@@ -418,6 +418,12 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::TokenEstimator.estimate_history": (
         _whole("token accounting over the sequence it is handed")
     ),
+    "protocore/runtime/context/compaction.py::estimate_history_tokens_uncalibrated": (
+        _whole("token accounting over the sequence it is handed")
+    ),
+    "protocore/runtime/context/compaction.py::TokenEstimator.estimate_history_uncalibrated": (
+        _whole("token accounting over the sequence it is handed")
+    ),
     "protocore/runtime/context/compaction.py::run_tier1_truncation": _whole(
         "sheds bytes from the whole transcript so it fits the context window"
     ),

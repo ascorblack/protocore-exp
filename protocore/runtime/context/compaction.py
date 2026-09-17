@@ -239,6 +239,14 @@ def _token_estimate_signature(rc: LoopConstants) -> tuple[float, ...]:
     Chars-per-token ratios and the flat image cost are dashboard-tunable and
     can be applied to a live process, so an estimate remembered under the old
     values must not be handed back under the new ones.
+
+    ``token_estimate_calibration`` is deliberately NOT here. It is a single
+    multiplier over the whole partition, applied where the number is handed
+    out, so what is cached does not depend on it. Keying on it split the cache
+    down the middle: the calibrator sizes the same history uncalibrated to
+    compare it against what the provider reported, and every such pass evicted
+    the calibrated entries the loop had just paid for, and was evicted by them
+    in turn — a measured 72% on the history estimate when the two alternate.
     """
     return (
         rc.token_count_chars_per_token_latin,
@@ -247,11 +255,17 @@ def _token_estimate_signature(rc: LoopConstants) -> tuple[float, ...]:
         rc.token_count_chars_per_token_cjk,
         rc.token_count_chars_per_token_json_struct,
         rc.token_count_image_tokens,
-        rc.token_estimate_calibration,
     )
 
 
 def _estimate_message_tokens_uncached(message: Message, rc: LoopConstants) -> int:
+    """The heuristic's own count of one message, before calibration.
+
+    The provider factor is applied by the callers below rather than here: it is
+    a multiplier over this whole number, so folding it in would make the cached
+    partition depend on a value that does not change the partition. See
+    :func:`_token_estimate_signature`.
+    """
     total = 0
     for block in message.content_blocks:
         if isinstance(block, ImageRefBlock):
@@ -260,8 +274,7 @@ def _estimate_message_tokens_uncached(message: Message, rc: LoopConstants) -> in
         total += estimate_tokens(_block_text_for_estimation(block), rc)
     if message.reasoning_content:
         total += estimate_tokens(message.reasoning_content, rc)
-    # In the provider's tokens, not the heuristic's: see LoopConstants.token_estimate_calibration.
-    return round(total * rc.token_estimate_calibration)
+    return total
 
 
 class _CachedEstimate:
@@ -325,8 +338,13 @@ class TokenEstimator:
         self._entries: OrderedDict[int, _CachedEstimate] = OrderedDict()
 
     def estimate_message(self, message: Message, rc: LoopConstants) -> int:
-        """Token weight of one message, from the cache when it is still valid."""
-        return self._estimate(message, rc, _token_estimate_signature(rc))
+        """Token weight of one message, from the cache when it is still valid.
+
+        In the provider's tokens, not the heuristic's: see
+        :attr:`LoopConstants.token_estimate_calibration`.
+        """
+        raw = self._estimate(message, rc, _token_estimate_signature(rc))
+        return round(raw * rc.token_estimate_calibration)
 
     def estimate_history(
         self,
@@ -334,6 +352,24 @@ class TokenEstimator:
         rc: LoopConstants,
     ) -> int:
         """Token weight of a sequence, paying only for messages not yet seen."""
+        signature = _token_estimate_signature(rc)
+        calibration = rc.token_estimate_calibration
+        return sum(
+            round(self._estimate(message, rc, signature) * calibration)
+            for message in history
+        )
+
+    def estimate_history_uncalibrated(
+        self,
+        history: Sequence[Message],
+        rc: LoopConstants,
+    ) -> int:
+        """The same sum in the heuristic's own tokens.
+
+        What the calibrator compares against the size the provider reported:
+        multiplying by the factor first and dividing it back out would be the
+        same arithmetic with a rounding error in it.
+        """
         signature = _token_estimate_signature(rc)
         return sum(self._estimate(message, rc, signature) for message in history)
 
@@ -410,6 +446,21 @@ def estimate_history_tokens(
     estimate is shared by all of them.
     """
     return _shared_estimator.estimate_history(history, rc)
+
+
+def estimate_history_tokens_uncalibrated(
+    history: Sequence[Message],
+    rc: LoopConstants,
+) -> int:
+    """Sum the heuristic's own count over ``history``, before calibration.
+
+    The calibrator's side of :attr:`LoopConstants.token_estimate_calibration`:
+    it asks what the heuristic makes of the very request the provider has just
+    reported a size for, and scales the factor by the ratio. Answered from the
+    same cache the calibrated readings use, because the two differ only in a
+    multiplier applied afterwards.
+    """
+    return _shared_estimator.estimate_history_uncalibrated(history, rc)
 
 
 def _content_is_already_compacted(text: str) -> bool:
