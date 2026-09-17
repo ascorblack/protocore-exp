@@ -22,6 +22,7 @@ import hashlib
 import logging
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -726,6 +727,11 @@ class QueryEngine:
             # would open by rewriting the whole history, which is the cost the
             # marker exists to remove.
             "_persisted_history",
+            # Its companion: the counter that says the marker was invalidated
+            # while a write was in flight. Reset apart from the marker it
+            # guards, it would let a hand-over record a write the store had
+            # already disowned.
+            "_persisted_history_epoch",
             "compaction_state",
             "compact_checkpoint",
             "context_manager",
@@ -845,11 +851,20 @@ class QueryEngine:
 
         # Mutable per-conversation state
         self.history: list[Message] = []
-        # The prefix of ``history`` the session store has already been given.
-        # Read through ``persisted_history_prefix``; see
+        # The prefix of ``history`` the session store has already been given,
+        # held weakly. Read through ``persisted_history_marker``; see
         # ``protocore.runtime.history_persist`` for what it is compared against
         # and why identity is the comparison.
-        self._persisted_history: tuple[Message, ...] | None = None
+        self._persisted_history: tuple[weakref.ReferenceType[Message], ...] | None = None
+        # Bumped whenever the marker is invalidated. A store may call
+        # ``forget_persisted_history`` from inside its own write — a deferred
+        # write it knows it has just lost — and the hand-over must not then
+        # record the write as durable on the way out.
+        self._persisted_history_epoch: int = 0
+        # Something durable about the session changed without the message
+        # sequence moving — a checkpoint was taken. Raised by
+        # ``note_session_state_changed``, lowered when the store has been told.
+        self._session_state_dirty: bool = False
         self.state: LoopState = LoopState.PENDING
         self.compaction_state = CompactionState()
         self.total_usage = TokenUsage()
@@ -2992,6 +3007,11 @@ class QueryEngine:
         await self._restore_provider_chain_position(snapshot)
 
         self.history = restored_history
+        # What the store holds for this session was written by whatever process
+        # ran the run before this one, and nothing in the payload says what that
+        # was. Stated rather than left to the identity comparison, which would
+        # report a rewrite only because deserialised messages are new objects.
+        self.forget_persisted_history()
         self.state = restored_state
         self.turn_count = restored_turn_count
         self._pending_interrupts = deserialise_interrupts(
@@ -3545,12 +3565,16 @@ class QueryEngine:
         return tuple(self.history)
 
     @property
-    def persisted_history_prefix(self) -> tuple[Message, ...] | None:
-        """The messages the session store has already been handed, in order.
+    def persisted_history_marker(self) -> tuple[weakref.ReferenceType[Message], ...] | None:
+        """Weak references to the messages the store has been handed, in order.
 
-        Held by reference rather than by value: the objects are the history's
-        own, so remembering them costs a pointer apiece and keeps nothing alive
-        that the history was not keeping alive.
+        Weak on purpose. A compaction exists partly to let the messages it
+        discarded be collected, and a marker holding them strongly would keep
+        the whole pre-compaction transcript alive until the next hand-over
+        replaced it — or, for a run that ends on a compaction, until the engine
+        itself went. A reference that has gone dead names a message the history
+        no longer holds, which is a rewrite, which is what the comparison would
+        have concluded anyway.
 
         ``None`` is not the same as empty. Empty is the store holding nothing
         and being known to hold nothing; ``None`` is the store's copy being
@@ -3560,18 +3584,52 @@ class QueryEngine:
         """
         return self._persisted_history
 
-    def note_history_persisted(self, history: tuple[Message, ...]) -> None:
-        """Record the prefix the store has now been given."""
-        self._persisted_history = history
+    @property
+    def persisted_history_epoch(self) -> int:
+        """Bumped whenever the marker is invalidated; a hand-over checks it."""
+        return self._persisted_history_epoch
+
+    def note_history_persisted(self, history: Sequence[Message]) -> None:
+        """Record the prefix the store has now been given.
+
+        Called only once the store's write has returned: until then the engine
+        has no evidence those messages are durable, and a marker that ran ahead
+        of the write would never offer them again.
+        """
+        self._persisted_history = tuple(weakref.ref(message) for message in history)
 
     def forget_persisted_history(self) -> None:
         """Say that the store no longer holds what it was told it holds.
 
-        A host that evicted rows, moved the session to another store or
-        rebuilt its copy from somewhere else calls this; the next hand-over is
-        a full rewrite rather than an append onto rows that are gone.
+        A host that evicted rows, moved the session to another store, rebuilt
+        its copy from somewhere else, or deferred a write that then failed
+        calls this; the next hand-over is a full rewrite rather than an append
+        onto rows that are gone.
+
+        Safe to call from inside the store's own write: the hand-over checks
+        :attr:`persisted_history_epoch` before recording anything, so a store
+        that disowns a write it is in the middle of is believed.
         """
         self._persisted_history = None
+        self._persisted_history_epoch += 1
+
+    @property
+    def session_state_changed(self) -> bool:
+        """Whether something durable changed that the message list does not show."""
+        return self._session_state_dirty
+
+    def note_session_state_changed(self) -> None:
+        """Say the session changed in a way the message sequence does not carry.
+
+        A checkpoint is the case this exists for: it is taken from the history
+        without altering it, so a store gated on the sequence moving would never
+        hear about it. The notice is lowered when the store has been told.
+        """
+        self._session_state_dirty = True
+
+    def note_session_state_persisted(self) -> None:
+        """Lower the notice: the store has been told."""
+        self._session_state_dirty = False
 
     def new_tool_call_id(self) -> str:
         return f"toolu_{uuid.uuid4().hex[:12]}"

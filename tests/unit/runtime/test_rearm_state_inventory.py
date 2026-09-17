@@ -60,6 +60,11 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_tool_call_ledger",
         "_tool_call_ledger_seq",
         "_tool_call_ledger_truncated",
+        # The notice that the session changed without the message sequence
+        # moving. Raised and handed over within one call, so a turn boundary
+        # can only ever find it lowered; reset rather than preserved, because
+        # a notice nobody consumed is not continuity the next turn needs.
+        "_session_state_dirty",
         # The wind-down and the finalisation latch it arms.
         "_soft_stop_cause",
         "_soft_stop_stage",

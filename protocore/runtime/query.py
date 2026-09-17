@@ -2131,6 +2131,12 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         )
         if ckpt is not None:
             engine.compact_checkpoint = ckpt
+            # A checkpoint is read out of the history without altering it, so
+            # the hand-over below has to be told the session changed — gated on
+            # the message sequence alone it would find nothing and say nothing,
+            # and a store that keeps the checkpoint would never hear it was
+            # taken.
+            engine.note_session_state_changed()
             persist_history(engine)
             from protocore.runtime.correctness_bind import commit_usage
 

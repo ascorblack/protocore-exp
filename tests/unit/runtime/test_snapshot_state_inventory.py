@@ -88,6 +88,11 @@ _PROCESS_LOCAL: dict[str, str] = {
         "store took from the process before it — so it starts empty and the "
         "first hand-over after a resume writes the history whole."
     ),
+    "_persisted_history_epoch": (
+        "the companion of _persisted_history: it counts invalidations of a "
+        "marker that itself cannot travel, so carrying it would be carrying "
+        "half of a pair."
+    ),
     "_resumed_skill_catalog_sha256": (
         "read OUT of the snapshot rather than written into it: it is the digest "
         "the catalog block had in the process that wrote the payload, held only "

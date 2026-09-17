@@ -14,8 +14,8 @@ frozen, so a message is replaced rather than edited whenever it changes: an
 append leaves every earlier object exactly where it was, and a compaction, a
 checkpoint or an eviction builds new ones. Identity comparison of the prefix
 reports the difference without anything having to declare it, and the prefix is
-held by reference, so the comparison costs a pointer per message and nothing is
-kept alive that the history was not keeping alive anyway.
+held weakly, so the comparison costs a pointer per message and nothing that
+left the history is kept alive by having once been persisted.
 
 An engine that has never handed anything over remembers nothing rather than
 remembering an empty history, and the two are not the same claim: a run picked
@@ -37,6 +37,16 @@ attaches to the engine:
 A store with only the first is called exactly as it was before. A store that
 subclasses :class:`HistoryPersister` and overrides nothing inherits the same
 behaviour through the default below.
+
+**Returning is the store's promise that the write landed.** The engine advances
+its marker only after the call returns, so a store that raises is offered the
+same messages again on the next round — which is the self-healing the old
+write-it-all-every-time contract had for free, and the one thing the delta path
+would otherwise throw away. A store that defers its write (a task, a queue, a
+batch) is promising on that write's behalf, and owes the engine a
+:meth:`~protocore.runtime.query_engine.QueryEngine.forget_persisted_history`
+call if the deferred write is dropped or fails; without it, the messages it
+dropped are never offered again.
 """
 
 from __future__ import annotations
@@ -76,6 +86,12 @@ class HistoryDelta:
     had been told were durable. The store replaces what it holds with
     :attr:`history`."""
 
+    session_state_changed: bool = False
+    """Something durable about the session changed that the message sequence
+    does not carry — a checkpoint was taken. A delta may carry this with
+    nothing appended and no rewrite, which is a store being told "the run
+    changed, write down whatever else you keep about it"."""
+
 
 class HistoryPersister:
     """The store's side of the contract, for a host that would rather subclass.
@@ -109,26 +125,33 @@ def persist_history(engine: QueryEngine) -> None:
     function once per round whether or not the round changed anything, and a
     store woken to be told that its copy is already correct pays the full
     write to find that out.
+
+    The marker advances after the store's call returns, never before: see the
+    module docstring on what returning promises.
     """
     incremental = getattr(engine, "persist_history_delta", None)
     persister = getattr(engine, "persist_session_history", None)
     if not callable(incremental) and not callable(persister):
         return
-    persisted = engine.persisted_history_prefix
+    persisted = engine.persisted_history_marker
     history = tuple(engine.history)
-    known: tuple[Message, ...] = () if persisted is None else persisted
+    known: tuple[object, ...] = () if persisted is None else persisted
     rewritten = (
         persisted is None
         or len(history) < len(known)
-        or any(before is not now for before, now in zip(known, history, strict=False))
+        or any(
+            before() is not now
+            for before, now in zip(persisted or (), history, strict=False)
+        )
     )
     appended = () if rewritten else history[len(known) :]
-    if not rewritten and not appended:
+    state_changed = engine.session_state_changed
+    if not rewritten and not appended and not state_changed:
         return
-    if persisted is None and not history:
+    if persisted is None and not history and not state_changed:
         # Nothing has been said, and nothing was ever stored to correct.
         return
-    engine.note_history_persisted(history)
+    epoch = engine.persisted_history_epoch
     if callable(incremental):
         incremental(
             engine,
@@ -137,7 +160,13 @@ def persist_history(engine: QueryEngine) -> None:
                 appended=appended,
                 persisted_through=0 if rewritten else len(known),
                 rewritten=rewritten,
+                session_state_changed=state_changed,
             ),
         )
     elif callable(persister):
         persister(engine)
+    if engine.persisted_history_epoch != epoch:
+        # The store disowned the write from inside it. Believe the store.
+        return
+    engine.note_history_persisted(history)
+    engine.note_session_state_persisted()

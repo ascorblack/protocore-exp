@@ -303,6 +303,12 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "all rewrite that outbound copy and leave persist untouched, so what "
         "this reads is the whole of what goes on the wire"
     ),
+    "protocore/runtime/query_engine.py::QueryEngine.note_history_persisted": _whole(
+        "records which messages the session store now holds, over the sequence "
+        "it is handed: what is persisted is the whole of what the session has "
+        "said, and a marker covering any less of it would let the next "
+        "hand-over append onto rows that were never written"
+    ),
     "protocore/runtime/history_persist.py::persist_history": _whole(
         "hands the session store what changed in the session transcript: what "
         "is persisted is the whole of what the session has said, because that "

@@ -1,7 +1,10 @@
 """The session store is told what changed, and only what changed."""
 from __future__ import annotations
 
+import gc
 from typing import Any
+
+import pytest
 
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.history_persist import (
@@ -28,6 +31,32 @@ class _RecordingStore(HistoryPersister):
 
     def persist_history_delta(self, engine: QueryEngine, delta: HistoryDelta) -> None:
         self.deltas.append(delta)
+
+
+class _FailingStore(HistoryPersister):
+    """A store whose write can be made to raise, or to silently do nothing."""
+
+    def __init__(self) -> None:
+        self.fail_next = False
+        self.drop_next = False
+        self.written: list[str] = []
+
+    def persist_session_history(self, engine: QueryEngine) -> None:
+        raise NotImplementedError
+
+    def persist_history_delta(self, engine: QueryEngine, delta: HistoryDelta) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("the store is down")
+        if self.drop_next:
+            self.drop_next = False
+            # What a store that defers its write and loses it owes the engine.
+            engine.forget_persisted_history()
+            return
+        if delta.rewritten:
+            self.written = [m.text for m in delta.history]
+        else:
+            self.written.extend(m.text for m in delta.appended)
 
 
 class _FullWriteOnlyStore(HistoryPersister):
@@ -172,7 +201,7 @@ def test_an_engine_with_no_store_attached_persists_nothing(
 
     persist_history(engine)
 
-    assert engine.persisted_history_prefix is None
+    assert engine.persisted_history_marker is None
 
 
 def test_an_empty_history_nobody_has_stored_is_not_handed_over(
@@ -191,3 +220,125 @@ def test_a_turn_boundary_keeps_what_the_store_already_holds() -> None:
     # A re-arm that forgot the marker would open every turn by rewriting the
     # whole history, which is the cost the marker exists to remove.
     assert "_persisted_history" in QueryEngine._REARM_PRESERVED_ATTRS
+
+
+def test_a_write_that_raised_is_offered_again(engine_factory: Any) -> None:
+    engine = engine_factory()
+    store = _FailingStore()
+    engine.persist_history_delta = store.persist_history_delta  # type: ignore[attr-defined]
+
+    engine.history.append(_msg("one"))
+    persist_history(engine)
+    engine.history.append(_msg("two"))
+    store.fail_next = True
+    with pytest.raises(RuntimeError):
+        persist_history(engine)
+    engine.history.append(_msg("three"))
+    persist_history(engine)
+
+    assert store.written == ["one", "two", "three"]
+
+
+def test_a_store_that_dropped_a_write_is_offered_the_messages_again(
+    engine_factory: Any,
+) -> None:
+    engine = engine_factory()
+    store = _FailingStore()
+    engine.persist_history_delta = store.persist_history_delta  # type: ignore[attr-defined]
+
+    engine.history.append(_msg("one"))
+    persist_history(engine)
+    engine.history.append(_msg("two"))
+    store.drop_next = True
+    persist_history(engine)
+    engine.history.append(_msg("three"))
+    persist_history(engine)
+
+    assert store.written == ["one", "two", "three"]
+
+
+def test_a_failed_first_write_leaves_the_store_unknown(engine_factory: Any) -> None:
+    engine = engine_factory()
+    store = _FailingStore()
+    engine.persist_history_delta = store.persist_history_delta  # type: ignore[attr-defined]
+
+    engine.history.append(_msg("one"))
+    store.fail_next = True
+    with pytest.raises(RuntimeError):
+        persist_history(engine)
+
+    assert engine.persisted_history_marker is None
+
+
+def test_a_session_state_change_is_handed_over_on_its_own(
+    engine_factory: Any,
+) -> None:
+    engine = engine_factory()
+    store = _RecordingStore()
+    _attach(engine, store)
+
+    engine.history.append(_msg("one"))
+    persist_history(engine)
+    # What a checkpoint does: the session changed, the sequence did not.
+    engine.note_session_state_changed()
+    persist_history(engine)
+
+    assert len(store.deltas) == 2
+    assert store.deltas[-1].session_state_changed is True
+    assert store.deltas[-1].appended == ()
+    assert store.deltas[-1].rewritten is False
+    # And the notice is lowered, so it does not fire a second hand-over.
+    persist_history(engine)
+    assert len(store.deltas) == 2
+
+
+def test_a_session_state_change_reaches_a_full_write_store(
+    engine_factory: Any,
+) -> None:
+    engine = engine_factory()
+    store = _FullWriteOnlyStore()
+    _attach(engine, store)
+
+    engine.history.append(_msg("one"))
+    persist_history(engine)
+    engine.note_session_state_changed()
+    persist_history(engine)
+
+    assert store.full_writes == 2
+
+
+def test_the_marker_does_not_keep_discarded_messages_alive(
+    engine_factory: Any,
+) -> None:
+    engine = engine_factory()
+    # A store that keeps only text, so nothing but the marker could hold the
+    # messages alive after the history lets go of them.
+    store = _FailingStore()
+    engine.persist_history_delta = store.persist_history_delta  # type: ignore[attr-defined]
+
+    engine.history.extend([_msg("one"), _msg("two")])
+    persist_history(engine)
+    marker = engine.persisted_history_marker
+    assert marker is not None
+    # What a compaction does to the messages it replaced: drops them.
+    engine.history.clear()
+    gc.collect()
+
+    assert all(ref() is None for ref in marker)
+
+
+async def test_a_restored_snapshot_does_not_trust_the_marker(
+    engine_factory: Any,
+) -> None:
+    engine = engine_factory()
+    store = _RecordingStore()
+    _attach(engine, store)
+
+    engine.history.append(_msg("one"))
+    persist_history(engine)
+    snapshot = engine.snapshot()
+
+    resumed = engine_factory()
+    await resumed.resume_from_snapshot(snapshot)
+
+    assert resumed.persisted_history_marker is None
