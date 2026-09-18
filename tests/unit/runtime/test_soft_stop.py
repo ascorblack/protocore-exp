@@ -196,18 +196,26 @@ class _ScriptedLLM:
 
 
 class _FailingLLM:
-    """Raises ``exc`` on the first call, then behaves like ``fallback``."""
+    """Raises ``exc`` on the ``fail_on``-th call, and behaves like ``fallback`` on every other.
 
-    def __init__(self, exc: BaseException, fallback: _ScriptedLLM) -> None:
+    ``fail_on`` exists because when the failure lands decides what the run has
+    to lose: a failure on the first call catches a run that has produced
+    nothing, a later one a run that has already done work worth reporting.
+    """
+
+    def __init__(
+        self, exc: BaseException, fallback: _ScriptedLLM, *, fail_on: int = 1
+    ) -> None:
         self._exc = exc
         self._fallback = fallback
+        self._fail_on = fail_on
         self.calls: list[LLMRequest] = []
 
     async def stream_with_tools(  # type: ignore[no-untyped-def]
         self, request: LLMRequest
     ) -> AsyncIterator[LLMStreamEvent]:
         self.calls.append(request)
-        if len(self.calls) == 1:
+        if len(self.calls) == self._fail_on:
             if False:  # pragma: no cover — generator protocol marker
                 yield LLMStreamEvent(name="never", payload={})
             raise self._exc
@@ -658,8 +666,12 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     The retries come first; the wind-down is what follows when they are spent.
     """
     rc = LoopConstants(model_context_window=4_096, llm_transient_error_retry_max_attempts=0)
-    recovered = _ScriptedLLM([{"text": "Here is the answer despite the failure."}])
-    llm = _FailingLLM(LLMProviderError("provider down"), recovered)
+    # A tool call first, so the run really has gathered something; the stream
+    # after it is the one the provider drops.
+    recovered = _ScriptedLLM(
+        [{"tool": "Read", "args": {}}, {"text": "Here is the answer despite the failure."}]
+    )
+    llm = _FailingLLM(LLMProviderError("provider down"), recovered, fail_on=2)
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
     events = [evt async for evt in engine.run(_user())]
@@ -673,6 +685,84 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     assert causes == {_soft_stop.CAUSE_PROVIDER_ERROR}
     assert engine.state is LoopState.COMPLETED
     assert _final_stop(events).payload["has_final_answer"] is True
+    # The upstream's own words ride on the state change: the host shows the
+    # operator why the run closed, and an answer is not the only trace of it.
+    details = {
+        str(e.payload.get("soft_stop_detail") or "")
+        for e in events
+        if e.type is EventType.STATE_CHANGED
+        and e.payload.get("reason") == "soft_stop_notified"
+    }
+    assert details == {"LLMProviderError: provider down"}
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_started_is_not_wound_down() -> None:
+    """Nothing was produced, so there is nothing to write a closing answer about.
+
+    A wind-down asks the model for the best answer its evidence supports. A run
+    whose first request never reached the model has no evidence, and asked to
+    close anyway it writes a summary of work it never did — the operator then
+    reads a polite report of nothing and never learns the provider failed. So
+    the failure itself is the outcome.
+    """
+    rc = LoopConstants(model_context_window=4_096, llm_transient_error_retry_max_attempts=0)
+    recovered = _ScriptedLLM([{"text": "An answer about nothing at all."}])
+    llm = _FailingLLM(LLMProviderError("grammar refused"), recovered)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert "soft_stop_notified" not in _reasons(events)
+    errors = [e for e in events if e.type is EventType.ERROR]
+    assert errors and errors[-1].payload["kind"] == "llm_provider_error"
+    assert "grammar refused" in str(errors[-1].payload.get("message") or "")
+    assert engine.state is LoopState.FAILED
+    assert engine.has_final_answer is False
+
+
+@pytest.mark.asyncio
+async def test_the_notice_names_the_cause_it_was_entered_for() -> None:
+    """A provider failure is not a budget, and the model is not told it is.
+
+    The one text for all five bounds said "the run has reached its budget" to a
+    run whose budget was untouched — the upstream had refused it. A model reads
+    that literally: it believes it was given turns, spent them, and owes a
+    summary of the work they bought.
+    """
+    rc = LoopConstants(model_context_window=4_096)
+    engine = _build_engine(rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()])
+
+    provider = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_PROVIDER_ERROR
+    )
+    deadline = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
+    budget = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_TOOL_CALL_BUDGET
+    )
+
+    assert "reached its budget" not in provider
+    assert "no budget was reached" in provider.lower()
+    assert "model endpoint failed" in provider
+    assert "time limit" in deadline
+    # The three bounds that really are budgets keep the wording they had.
+    assert budget == rc.soft_stop_notice_text.replace(
+        "{cause}", _soft_stop.CAUSE_TOOL_CALL_BUDGET
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_blank_cause_notice_falls_back_to_the_general_one() -> None:
+    rc = LoopConstants(model_context_window=4_096, soft_stop_notice_text_provider_error="")
+    engine = _build_engine(rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()])
+
+    text = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_PROVIDER_ERROR
+    )
+
+    assert text == rc.soft_stop_notice_text.replace(
+        "{cause}", _soft_stop.CAUSE_PROVIDER_ERROR
+    )
 
 
 @pytest.mark.asyncio

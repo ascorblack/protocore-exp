@@ -49,6 +49,7 @@ from protocore.runtime.context.compaction import _session_history_seed_indices
 from protocore.runtime.longfile_convergence import _active_file_tail
 from protocore.runtime.query import (
     _apply_updated_input,
+    _run_produced_output,
     _assert_history_has_matching_pending_tool_use,
     _history_has_tool_result,
     _history_tool_result_is_terminal,
@@ -88,6 +89,9 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
     ),
     "test_active_file_tail_needs_this_runs_own_binding": (
         "protocore/runtime/longfile_convergence.py::_active_file_tail",
+    ),
+    "test_produced_output_is_about_the_round_now_driving": (
+        "protocore/runtime/query.py::_run_produced_output",
     ),
     "test_seed_indices_select_every_seeded_turn_and_nothing_else": (
         "protocore/runtime/context/compaction.py::_session_history_seed_indices",
@@ -242,6 +246,56 @@ def test_prose_gate_reads_the_tail_and_not_a_seeded_turn(engine_factory) -> None
 
     engine.history = []
     assert _prose_gate_just_injected(engine) is False
+
+
+def test_produced_output_is_about_the_round_now_driving(engine_factory) -> None:
+    """A previous run's work is not this run's evidence.
+
+    Its registry reason is that the question starts after the last message a
+    caller put in. Widen it to the whole transcript and a session that has ever
+    answered anything reads as a run that has produced something — so a run
+    whose very first request the provider refused would be wound down and asked
+    to summarise, and it would summarise the previous run's work as its own.
+    """
+    engine: QueryEngine = engine_factory()
+    prior_work = [
+        _seeded(_user(_PRIOR_TASK)),
+        _seeded(_assistant(TextBlock(text="Here is the retrospective."))),
+    ]
+
+    engine.history = [*prior_work, _user(_NEW_TASK)]
+    assert _run_produced_output(engine) is False
+
+    # A prior run left verbatim, without the executor's tag: still not this run's.
+    engine.history = [
+        _user(_PRIOR_TASK),
+        _assistant(TextBlock(text="Here is the retrospective.")),
+        _user(_NEW_TASK),
+    ]
+    assert _run_produced_output(engine) is False
+
+    # The wind-down's own notice is the runtime's words, not a caller's, so it
+    # does not move the boundary past the work it follows.
+    engine.history = [
+        _user(_NEW_TASK),
+        _assistant(TextBlock(text="Reading the plan now.")),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="wrap up")],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: "soft_stop"},
+        ),
+    ]
+    assert _run_produced_output(engine) is True
+
+    engine.history = [*prior_work, _user(_NEW_TASK), _assistant(TextBlock(text="  "))]
+    assert _run_produced_output(engine) is False  # whitespace is not a word
+
+    engine.history = [
+        *prior_work,
+        _user(_NEW_TASK),
+        _assistant(ToolUseBlock(tool_call_id="toolu_1", name="Read", arguments_json="{}")),
+    ]
+    assert _run_produced_output(engine) is True
 
 
 # ---------------------------------------------------------------------------

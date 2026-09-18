@@ -530,6 +530,18 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
             f"{_CLAIMS}::test_pending_tool_use_assertion_is_keyed_on_the_approved_call",
         )
     ),
+    # --- what the round now driving has produced ----------------------------
+    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
+        "answers about the round now driving: it starts at the message AFTER "
+        "the last one a caller put in — the operator's prompt, or the tool "
+        "result a parked run was resumed with — so a prior run's prose and "
+        "tool calls precede the boundary and cannot answer it. The boundary is "
+        "re-derived rather than taken from the seed tag because the tag is set "
+        "by the executor and not by every host, and a host that hands over a "
+        "session's earlier turns verbatim would otherwise have the predicate "
+        "answer for a run that is over",
+        f"{_CLAIMS}::test_produced_output_is_about_the_round_now_driving",
+    ),
     # --- the tail --------------------------------------------------------
     "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected": _run_scoped(
         "inspects the LAST message only; the seed is prepended, so the tail always belongs to this run",

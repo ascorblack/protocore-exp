@@ -72,6 +72,10 @@ PreservedAnswerFinish = Callable[..., AsyncIterator[TurnEvent]]
 #: Whether such an answer exists.
 HasPreservedAnswer = Callable[[Any], bool]
 
+#: Whether this run has produced anything at all — a word of prose or a tool
+#: call — that a final answer could be about.
+HasRunOutput = Callable[[Any], bool]
+
 #: Say on the wire that the run moved to another provider.
 FallbackAnnouncer = Callable[..., TurnEvent]
 
@@ -114,6 +118,7 @@ class ProviderFailurePolicy:
         "_llm_terminal",
         "_log_crash",
         "_preserved_finish",
+        "_produced_output",
         "_retries",
         "_retry_event",
         "_wind_down",
@@ -128,6 +133,7 @@ class ProviderFailurePolicy:
         has_preserved_answer: HasPreservedAnswer,
         has_terminal_tool_result: HasPreservedAnswer,
         has_final_answer: HasPreservedAnswer,
+        produced_output: HasRunOutput,
         preserved_finish: PreservedAnswerFinish,
         wind_down: WindDownEntry,
         wind_down_budget: WindDownBudget,
@@ -144,6 +150,7 @@ class ProviderFailurePolicy:
         self._has_preserved_answer = has_preserved_answer
         self._has_terminal_tool_result = has_terminal_tool_result
         self._has_final_answer = has_final_answer
+        self._produced_output = produced_output
         self._preserved_finish = preserved_finish
         self._wind_down = wind_down
         self._wind_down_budget = wind_down_budget
@@ -299,9 +306,21 @@ class ProviderFailurePolicy:
             if turn.outcome.directive is not TurnDirective.proceed:
                 return
 
+        # A wind-down asks the model for the best answer its evidence supports,
+        # and a run whose very first request never reached the model has no
+        # evidence: no prose, no tool call, nothing done. Asked to close anyway
+        # it invents the run — it reports on work it never started, and the
+        # failure reaches the operator as a polite summary of nothing instead of
+        # as an error. So the wind-down is for runs that got somewhere; a run
+        # that produced nothing fails on the provider's own error, which is the
+        # true thing to say about it.
         wound = (
-            self._wind_down(engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR)
-            if wind_down_when_stuck
+            self._wind_down(
+                engine,
+                cause=_soft_stop.CAUSE_PROVIDER_ERROR,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            if wind_down_when_stuck and self._produced_output(engine)
             else []
         )
         if wound:

@@ -274,7 +274,9 @@ if TYPE_CHECKING:
 _logger = get_logger(__name__)
 
 
-def _enter_soft_stop(engine: QueryEngine, *, cause: str) -> list[TurnEvent]:
+def _enter_soft_stop(
+    engine: QueryEngine, *, cause: str, detail: str = ""
+) -> list[TurnEvent]:
     """Begin the run wind-down for ``cause``. The ONE entry point.
 
     Returns the events the caller must forward, or an empty list when the
@@ -296,7 +298,7 @@ def _enter_soft_stop(engine: QueryEngine, *, cause: str) -> list[TurnEvent]:
         return []
     if _soft_stop.is_armed(engine):
         return []
-    events = _soft_stop.enter(engine, cause_name=cause)
+    events = _soft_stop.enter(engine, cause_name=cause, detail=detail)
     if events:
         # The terminal-only guard shares this latch with the voluntary-finish
         # contract repair: it is what makes a blocked non-terminal dispatch
@@ -6639,6 +6641,46 @@ def _this_run_messages(engine: QueryEngine) -> list[Message]:
     ]
 
 
+def _run_produced_output(engine: QueryEngine) -> bool:
+    """Whether the current run has anything a final answer could be about.
+
+    True once the model has written a word of prose or called a tool, or once a
+    tool result has come back. Thinking alone is not output: a run that spent a
+    round reasoning and then lost the endpoint has nothing to tell the user
+    about, and the reasoning is not shown to them anyway.
+
+    The run's own turns are the ones after the last message the CALLER put in —
+    the operator's prompt, or the tool result a parked run was resumed with.
+    That boundary is used rather than :func:`_this_run_messages` because the
+    seed tag it reads is set by the executor and not by every host: a host that
+    hands the engine a session's earlier turns verbatim would have the
+    predicate answer for a previous run. Anything after the last caller message
+    belongs to the round now driving, whoever assembled the history.
+
+    Asked by the provider-failure policy before it winds a run down. A
+    wind-down is a request for the best answer the evidence supports; put to a
+    run with no evidence it produces an invented one, which is worse than the
+    error it replaced. Pure / total — never raises.
+    """
+    start = 0
+    for index, message in enumerate(engine.history):
+        if message.role is MessageRole.user and not message.metadata.get(
+            SYNTHETIC_RECOVERY_METADATA_KEY
+        ):
+            start = index + 1
+    for message in engine.history[start:]:
+        if message.role is MessageRole.tool:
+            return True
+        if message.role is not MessageRole.assistant:
+            continue
+        for block in message.content_blocks:
+            if isinstance(block, ToolUseBlock):
+                return True
+            if isinstance(block, TextBlock) and block.text.strip():
+                return True
+    return False
+
+
 # Universal terminal-tool nudge.
 #
 # Any tenant declares its terminal tool name via
@@ -11953,6 +11995,7 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             has_preserved_answer=_preserve_completed_answer_on_stream_error,
             has_terminal_tool_result=_history_has_terminal_tool_result,
             has_final_answer=run_has_final_answer,
+            produced_output=_run_produced_output,
             preserved_finish=_complete_run_on_preserved_answer,
             wind_down=_enter_soft_stop,
             wind_down_budget=_soft_stop_turn_budget,

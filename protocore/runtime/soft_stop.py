@@ -219,20 +219,47 @@ def restricted_policy(
 
 
 def notification_text(engine: QueryEngine, *, cause_name: str) -> str:
+    """The notice this cause puts in front of the model.
+
+    The wind-down is one path for five bounds, and the notice used to be one
+    text for all five — which made it say "the run has reached its budget" to a
+    run whose budget was untouched: the upstream had refused every request and
+    the retries were spent. A model reads that literally. It infers that it was
+    given turns and spent them, and it writes a closing summary of work it
+    never did; the operator gets a polite report of nothing and no sign that
+    the provider failed. So a cause that is not a budget names itself, and the
+    three that really are budgets — the tool-call budget, the turn cap, the
+    output-token budget — keep the general text.
+
+    A cause whose own text is blank falls back to the general one. An empty
+    general notice suppresses the message entirely, which is what its constant
+    documents.
+    """
     rc = engine.config.rc
-    template = rc.soft_stop_notice_text
+    if cause_name == CAUSE_PROVIDER_ERROR:
+        template = rc.soft_stop_notice_text_provider_error or rc.soft_stop_notice_text
+    elif cause_name == CAUSE_DEADLINE:
+        template = rc.soft_stop_notice_text_deadline or rc.soft_stop_notice_text
+    else:
+        template = rc.soft_stop_notice_text
     if not template:
         return ""
     return template.replace("{cause}", cause_name)
 
 
-def enter(engine: QueryEngine, *, cause_name: str) -> list[TurnEvent]:
+def enter(engine: QueryEngine, *, cause_name: str, detail: str = "") -> list[TurnEvent]:
     """Start the wind-down. Idempotent — a second call returns no events.
 
     Appends the notification to history and narrows the surface, emitting the
     two state changes that make both observable. The caller owns the rest of the
     turn mechanics: granting the wind-down its turns, persisting the snapshot,
     and rebuilding the context so the next stream sees the narrowed surface.
+
+    ``detail`` is what the cause itself said, in the words of whatever produced
+    it — the upstream's own error text, typically. It rides on the state events
+    and nowhere else: the model is told the shape of the stop by the notice,
+    while a host that has to SHOW the operator why a run ended needs the
+    original message, and reconstructing it from a log is not showing it.
     """
     if is_armed(engine):
         return []
@@ -244,8 +271,9 @@ def enter(engine: QueryEngine, *, cause_name: str) -> list[TurnEvent]:
     _append_notice(engine, cause_name=cause_name)
 
     allowed = terminal_surface(engine)
+    extra: dict[str, object] = {"soft_stop_detail": detail} if detail else {}
     events = [
-        _state_event(engine, REASON_NOTIFIED, cause_name=cause_name),
+        _state_event(engine, REASON_NOTIFIED, cause_name=cause_name, **extra),
     ]
     # The surface is narrowed in the same entry, not a turn later: the model's
     # very next request is the one that must not carry a working tool.
@@ -256,6 +284,7 @@ def enter(engine: QueryEngine, *, cause_name: str) -> list[TurnEvent]:
             REASON_WITHDRAWN,
             cause_name=cause_name,
             allowed_tools=sorted(allowed),
+            **extra,
         )
     )
     _logger.warning(
