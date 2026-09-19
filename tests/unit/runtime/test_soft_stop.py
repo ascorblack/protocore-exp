@@ -742,7 +742,11 @@ async def test_the_notice_names_the_cause_it_was_entered_for() -> None:
     )
 
     assert "reached its budget" not in provider
-    assert "no budget was reached" in provider.lower()
+    assert "not a budget limit" in provider.lower()
+    assert "earlier requests may have consumed" in provider.lower()
+    stalled = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_MODEL_NO_PROGRESS)
+    assert "model output failure" in stalled
+    assert "Requests consumed tokens and time" in stalled
     assert "model endpoint failed" in provider
     assert "time limit" in deadline
     # The three bounds that really are budgets keep the wording they had.

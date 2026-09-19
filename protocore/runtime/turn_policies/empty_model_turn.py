@@ -251,14 +251,14 @@ class EmptyModelTurnPolicy:
         below under the original reason.
         """
         engine = turn.engine
-        events = self._enter_wind_down(engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR)
+        events = self._enter_wind_down(engine, cause=_soft_stop.CAUSE_MODEL_NO_PROGRESS, detail=f"{kind}: {message}")
         if events:
             turn.outcome.directive = TurnDirective.restart_turn
             turn.outcome.turn_budget = self._wind_down_budget(
                 engine, turn.flags.assistant_message_idx
             )
             turn.outcome.rebuild_context = True
-            turn.outcome.reason = _soft_stop.CAUSE_PROVIDER_ERROR
+            turn.outcome.reason = _soft_stop.CAUSE_MODEL_NO_PROGRESS
             for event in events:
                 yield event
             await engine.persist_snapshot()
