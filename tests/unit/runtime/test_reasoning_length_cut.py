@@ -190,6 +190,46 @@ async def test_spent_ladder_gets_one_default_wind_down_attempt_then_fails(
 
 
 @pytest.mark.asyncio
+async def test_spent_ladder_winds_down_as_a_model_that_stopped_progressing(
+    engine_factory, in_memory_runtime
+) -> None:
+    """The endpoint answered every round, so the wind-down must not say it failed.
+
+    Under the provider-error cause the notice told the model the endpoint was
+    unreachable, and the model's closing message passed that on to the operator
+    as the reason the run stopped.
+    """
+    from protocore.runtime import soft_stop as _soft_stop
+
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=4_096, reasoning_length_cut_retries=2)
+    )
+    engine.apply_live_controls(thinking_enabled=True, reasoning_effort="high")
+    llm = _CutWhileReasoningLLM(cut_rounds=3, answer="best available answer")
+    events = await _run(engine, llm)
+
+    notified = [
+        event
+        for event in events
+        if event.type is EventType.STATE_CHANGED
+        and event.payload.get("reason") == "soft_stop_notified"
+    ]
+    assert [event.payload.get("soft_stop_cause") for event in notified] == [
+        _soft_stop.CAUSE_MODEL_NO_PROGRESS
+    ]
+    notice = next(
+        block.text
+        for message in llm.calls[-1].messages
+        if message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+        for block in message.content_blocks
+        if isinstance(block, TextBlock)
+    )
+    assert "model endpoint failed" not in notice
+    assert "stopped making progress" in notice
+
+
+@pytest.mark.asyncio
 async def test_spent_ladder_can_answer_on_its_one_wind_down_attempt(
     engine_factory, in_memory_runtime
 ) -> None:

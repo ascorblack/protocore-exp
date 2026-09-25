@@ -948,6 +948,70 @@ class LoopConstants(BaseModel):
             "overridable."
         ),
     )
+    soft_stop_notice_text_deadline: str = Field(
+        default=(
+            "[internal control — not part of the reply] The run has reached its "
+            "wall-clock time limit and is now closing. This is not a token or "
+            "tool budget: the time allowed for this run is up. Every tool except "
+            "the finalizing one has been removed from your surface, so no "
+            "further work is possible. Write your final response to the user "
+            "now, as an ordinary assistant message in plain prose, in the "
+            "language of the conversation: your best answer from what you "
+            "already have, and where results are. Say plainly what you could not "
+            "establish or finish; do not describe your steps. Then call the "
+            "terminal tool to end the run. "
+            "[внутреннее управление — не часть ответа] Выполнение достигло "
+            "предела по времени и сейчас завершается. Это не предел по токенам "
+            "или вызовам инструментов: закончилось отведённое на выполнение "
+            "время. Все инструменты, кроме завершающего, убраны из вашей "
+            "поверхности, продолжать работу нельзя. Напишите финальный ответ "
+            "пользователю сейчас — обычным сообщением ассистента, простым "
+            "текстом, на языке диалога: лучший ответ из уже собранного и где "
+            "лежат результаты. Прямо укажите, что выяснить или доделать не "
+            "удалось; не описывайте шаги. Затем вызовите терминальный "
+            "инструмент, чтобы завершить выполнение."
+        ),
+        description=(
+            "The wind-down notice used when the cause is ``deadline``. The run "
+            "really did run out of something and has work to answer from, so it "
+            "asks for the same answer as ``soft_stop_notice_text``; it names the "
+            "wall clock rather than a budget because a model told it spent a "
+            "budget explains the stop by the wrong bound. Empty string falls "
+            "back to ``soft_stop_notice_text``. Per-tenant overridable."
+        ),
+    )
+    soft_stop_notice_text_model_no_progress: str = Field(
+        default=(
+            "[internal control — not part of the reply] The model returned "
+            "reasoning repeatedly without an answer or a tool call, and the "
+            "recovery attempts are spent. This is a failure of the model's "
+            "output, not of the endpoint and not a budget limit; the requests "
+            "did consume tokens and time. Every tool except the finalizing one "
+            "has been removed from your surface. Write one short final message, "
+            "as an ordinary assistant message in plain prose, in the language of "
+            "the conversation: the verified results of this run, if any, what "
+            "remains unfinished, and that the model stopped making progress. "
+            "Then call the terminal tool to end the run. "
+            "[внутреннее управление — не часть ответа] Модель несколько раз "
+            "вернула рассуждения без ответа и без вызова инструмента, попытки "
+            "восстановления исчерпаны. Это сбой вывода модели, а не эндпоинта и "
+            "не предел бюджета; запросы расходовали токены и время. Все "
+            "инструменты, кроме завершающего, убраны из вашей поверхности. "
+            "Напишите одно короткое финальное сообщение обычным текстом, на "
+            "языке диалога: проверенные результаты этого выполнения, если они "
+            "есть, что осталось незавершённым и что модель перестала "
+            "продвигаться. Затем вызовите терминальный инструмент, чтобы "
+            "завершить выполнение."
+        ),
+        description=(
+            "The wind-down notice used when the cause is ``model_no_progress`` — "
+            "the model kept returning reasoning with neither an answer nor a "
+            "tool call. The endpoint answered every request, so the provider "
+            "text (which tells the model the endpoint failed) would have it "
+            "report an outage that did not happen. Empty string falls back to "
+            "``soft_stop_notice_text``. Per-tenant overridable."
+        ),
+    )
     run_tool_call_ledger_max_entries: int = Field(
         default=500,
         ge=0,

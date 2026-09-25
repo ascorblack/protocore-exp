@@ -8,6 +8,14 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The wind-down notice names a deadline and a stalled model for what they
+  are.** A run stopped by its wall clock was told it had reached its budget,
+  and a run whose model kept returning reasoning with no answer and no tool
+  call was told the model endpoint had failed — which the model then passed on
+  to the operator as the reason. `soft_stop_notice_text_deadline` names the
+  time limit, and the new `model_no_progress` cause, entered by the
+  empty-round policy, carries `soft_stop_notice_text_model_no_progress`. Blank
+  texts fall back to the general notice.
 - **The wind-down notice does not outlive its run.** The "tools are withdrawn,
   write your answer" message the loop writes into history when a run winds
   down stayed there after the run ended. When the wind-down's own final turn

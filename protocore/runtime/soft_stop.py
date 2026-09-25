@@ -77,6 +77,7 @@ CAUSE_MAX_TURNS: Final[str] = "max_turns"
 CAUSE_OUTPUT_TOKEN_BUDGET: Final[str] = "output_token_budget"
 CAUSE_DEADLINE: Final[str] = "deadline"
 CAUSE_PROVIDER_ERROR: Final[str] = "provider_error"
+CAUSE_MODEL_NO_PROGRESS: Final[str] = "model_no_progress"
 
 CAUSES: Final[frozenset[str]] = frozenset(
     {
@@ -85,6 +86,7 @@ CAUSES: Final[frozenset[str]] = frozenset(
         CAUSE_OUTPUT_TOKEN_BUDGET,
         CAUSE_DEADLINE,
         CAUSE_PROVIDER_ERROR,
+        CAUSE_MODEL_NO_PROGRESS,
     }
 )
 
@@ -237,6 +239,10 @@ def notification_text(engine: QueryEngine, *, cause_name: str) -> str:
     rc = engine.config.rc
     if cause_name == CAUSE_PROVIDER_ERROR:
         template = rc.soft_stop_notice_text_provider_error or rc.soft_stop_notice_text
+    elif cause_name == CAUSE_MODEL_NO_PROGRESS:
+        template = rc.soft_stop_notice_text_model_no_progress or rc.soft_stop_notice_text
+    elif cause_name == CAUSE_DEADLINE:
+        template = rc.soft_stop_notice_text_deadline or rc.soft_stop_notice_text
     else:
         template = rc.soft_stop_notice_text
     if not template:
@@ -391,6 +397,7 @@ __all__ = [
     "CAUSES",
     "CAUSE_DEADLINE",
     "CAUSE_MAX_TURNS",
+    "CAUSE_MODEL_NO_PROGRESS",
     "CAUSE_OUTPUT_TOKEN_BUDGET",
     "CAUSE_PROVIDER_ERROR",
     "CAUSE_TOOL_CALL_BUDGET",

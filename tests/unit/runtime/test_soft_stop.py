@@ -852,6 +852,19 @@ def test_the_notice_names_the_cause_it_was_entered_for() -> None:
     assert "not a budget limit" in provider.lower()
     assert "model endpoint failed" in provider
 
+    # A model that kept reasoning without answering is not an endpoint outage.
+    stalled = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_MODEL_NO_PROGRESS
+    )
+    assert "model endpoint failed" not in stalled
+    assert "reached its budget" not in stalled
+    assert "failure of the model's output" in stalled
+
+    # The wall clock is named as the wall clock.
+    deadline = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
+    assert "time limit" in deadline
+    assert "reached its budget" not in deadline
+
     # The bounds that really are budgets keep the wording they had.
     for cause in (
         _soft_stop.CAUSE_TOOL_CALL_BUDGET,
