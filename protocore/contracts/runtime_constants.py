@@ -561,7 +561,25 @@ class LoopConstants(BaseModel):
             "whatever it is given, so a small unit comes back no smaller and "
             "the call bought nothing; the net-gain guard discards such a "
             "summary, but only after paying for it. 0 leaves the floor at the "
-            "empty-wrapper size, which is the smallest it can ever be."
+            "empty-wrapper size, which is the smallest it can ever be. Adjacent "
+            "units that are each below the floor are not left alone for that: "
+            "they are summarised together, see "
+            "compaction_summary_group_max_tokens."
+        ),
+    )
+    compaction_summary_group_max_tokens: int = Field(
+        default=6_000,
+        ge=0,
+        description=(
+            "How large a group of adjacent small units Tier 2 may summarise in "
+            "one call. A unit below compaction_summary_min_unit_tokens is not "
+            "worth a call on its own, but a history can consist of nothing "
+            "else: a run of many rounds of one short tool call each has no unit "
+            "the floor admits, and without grouping no tier could take a token "
+            "off it. Consecutive small units of the same provenance, with "
+            "nothing between them, are joined until the next one would pass "
+            "this size, and a group that clears the floor is summarised as one "
+            "unit. 0 disables grouping."
         ),
     )
     compaction_summary_min_words: int = Field(

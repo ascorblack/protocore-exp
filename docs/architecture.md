@@ -590,7 +590,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   What a pass is allowed to cost is bounded on every axis: a unit below
   `compaction_summary_min_unit_tokens` is not sent at all (a summariser writes
   a sentence or three whatever it is handed, so below some size the call is
-  spent to discover the summary is no smaller), the word budget in the prompt
+  spent to discover the summary is no smaller — adjacent units that are each
+  below it are joined, up to `compaction_summary_group_max_tokens`, and
+  summarised as one, so a history made only of short rounds can still shrink),
+  the word budget in the prompt
   scales with the unit rather than being a fixed sentence count and is capped
   at what the output cap can hold at
   `compaction_summary_output_tokens_per_word` (four — the English figure of two

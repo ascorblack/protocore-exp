@@ -475,6 +475,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::_plan_tier2": _whole(
         "decides which units anywhere in the transcript Tier 2 would send"
     ),
+    "protocore/runtime/context/compaction.py::_group_small_units": _whole(
+        "joins adjacent units by INDEX into the transcript Tier 2 was handed; "
+        "adjacency is a fact about positions in the whole list"
+    ),
     "protocore/runtime/context/compaction.py::tier2_has_work": _whole(
         "asks, without calling the summariser, whether Tier 2 has a unit to send"
     ),

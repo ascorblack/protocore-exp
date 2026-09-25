@@ -1651,9 +1651,10 @@ def _plan_tier2(
 
     units = _build_summarisation_units(history, eligible_upper, protected_indices=protected)
     # Which units are worth a call at all, decided before any call is made:
-    # not already summarised, and big enough that a summary could come back
-    # smaller than what it replaces.
-    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]] = []
+    # not already summarised, and big enough — alone, or joined with the small
+    # units beside it (see ``_group_small_units``) — that a summary could come
+    # back smaller than what it replaces.
+    candidates: list[tuple[_SummarisationUnit, str, list[Message], int, bool, bool]] = []
     for unit in units:
         anchor = history[unit.anchor_idx]
         # A4 idempotency — never re-summarise an existing compaction summary
@@ -1698,15 +1699,90 @@ def _plan_tier2(
             _compaction_wrapper_floor_tokens(anchor_key, rc),
             rc.compaction_summary_min_unit_tokens,
         )
-        if before_tokens <= floor:
-            continue
-        jobs.append((unit, anchor_key, unit_messages, before_tokens, seed_only))
+        candidates.append(
+            (unit, anchor_key, unit_messages, before_tokens, seed_only, before_tokens > floor)
+        )
 
     return _Tier2Plan(
         synthetic_removed=len(synthetic_nudges),
         synthetic_tokens_freed=synthetic_tokens_freed,
-        jobs=jobs,
+        jobs=_group_small_units(history, candidates, rc),
     )
+
+
+def _group_small_units(
+    history: list[Message],
+    candidates: list[tuple[_SummarisationUnit, str, list[Message], int, bool, bool]],
+    rc: LoopConstants,
+) -> list[tuple[_SummarisationUnit, str, list[Message], int, bool]]:
+    """The Tier 2 jobs: every unit over the floor, and runs of small ones joined.
+
+    A unit under the floor is not worth a call by itself, and it used to be
+    skipped for good. A run that works in many short rounds — one small tool
+    call and a short result each, hundreds of times — then builds a history in
+    which no unit clears the floor, and Tier 2 had nothing to do however large
+    the history grew. Over a live history of that shape, 160 units of 300 to
+    1,400 tokens, not one was eligible, every pass freed nothing and the run
+    failed on the retry budget.
+
+    So adjacent small units are joined into one: the summary replaces the first
+    unit's anchor and every other member of every unit in the group is dropped,
+    which keeps tool pairing whole because each unit is already a closed
+    pairing component. Units join only when nothing lies between them (a
+    summary, an operator turn, a unit left alone for any reason ends the run),
+    when every unit is contiguous in itself, and when they share a seed
+    provenance, so the replacement can carry exactly one. A group stops before
+    it would pass ``compaction_summary_group_max_tokens`` and is sent only when
+    it clears the same floor a single unit must. The group is keyed by its
+    first anchor, so the failure census and the dedup set treat it as that
+    unit.
+    """
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int, bool]] = []
+    group: list[tuple[_SummarisationUnit, str, list[Message], int, bool, bool]] = []
+    group_cap = rc.compaction_summary_group_max_tokens
+
+    def contiguous(unit: _SummarisationUnit) -> bool:
+        return unit.indices == tuple(range(unit.indices[0], unit.indices[-1] + 1))
+
+    def flush() -> None:
+        if len(group) >= 2:
+            first_unit, first_key, _messages, _before, first_seed_only, _big = group[0]
+            tokens = sum(member[3] for member in group)
+            floor = max(
+                _compaction_wrapper_floor_tokens(first_key, rc),
+                rc.compaction_summary_min_unit_tokens,
+            )
+            if tokens > floor:
+                indices = tuple(index for member in group for index in member[0].indices)
+                jobs.append(
+                    (
+                        _SummarisationUnit(anchor_idx=first_unit.anchor_idx, indices=indices),
+                        first_key,
+                        [history[index] for index in indices],
+                        tokens,
+                        first_seed_only,
+                    )
+                )
+        group.clear()
+
+    for candidate in candidates:
+        unit, anchor_key, unit_messages, before_tokens, seed_only, over_floor = candidate
+        if over_floor:
+            flush()
+            jobs.append((unit, anchor_key, unit_messages, before_tokens, seed_only))
+            continue
+        if group_cap <= 0 or not contiguous(unit):
+            flush()
+            continue
+        if group and (
+            unit.indices[0] != group[-1][0].indices[-1] + 1
+            or seed_only != group[0][4]
+            or sum(member[3] for member in group) + before_tokens > group_cap
+        ):
+            flush()
+        group.append(candidate)
+    flush()
+    return jobs
 
 
 def tier2_has_work(

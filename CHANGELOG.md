@@ -8,6 +8,14 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A history made only of short rounds can be compacted.** Tier 2 skipped
+  every unit below `compaction_summary_min_unit_tokens`, and the fold takes only
+  summaries and operator turns, so a run that works in many rounds of one short
+  tool call each built a history no tier could reduce: every pass freed
+  nothing and the run failed on the retry budget. Adjacent small units of the
+  same provenance, with nothing between them, are now joined up to
+  `compaction_summary_group_max_tokens` (6,000; 0 disables it) and summarised
+  as one unit when the group clears the floor.
 - **A failed round never completes on an earlier run's answer.** Completing a
   failed run "on its preserved answer" read every message not tagged as
   seeded, so on a host that hands the engine a session's earlier turns
