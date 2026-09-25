@@ -6,6 +6,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The wind-down notice does not outlive its run.** The "tools are withdrawn,
+  write your answer" message the loop writes into history when a run winds
+  down stayed there after the run ended. When the wind-down's own final turn
+  failed — a provider outage that caused the wind-down also killed the answer —
+  the notice was the last thing in the session, and the next turn obeyed it:
+  the model reported what it had not finished and called nothing, although
+  every tool was back. The notice is removed once the drive reaches a terminal
+  state and written back only for a resumed run that is still wound down.
+
 ## [2.0.0a21] - 2026-09-25
 
 ### Added

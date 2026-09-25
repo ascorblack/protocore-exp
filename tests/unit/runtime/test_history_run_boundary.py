@@ -265,6 +265,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/query.py::_emit_llm_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
+    "protocore/runtime/soft_stop.py::leave": _whole(
+        "removes the wind-down notice wherever it sits in the session transcript, however it "
+        "got there: the executor's seed may carry one whose wind-down was never driven to its end"
+    ),
     "protocore/runtime/query.py::_emit_empty_completion_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),

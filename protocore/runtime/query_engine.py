@@ -1702,6 +1702,12 @@ class QueryEngine:
             yield
         finally:
             self._current_turn_task = None
+            if self.is_terminal:
+                # The wind-down notice was for this run; the next one starts
+                # with its tools and must not read that they are gone.
+                from protocore.runtime import soft_stop as _soft_stop
+
+                _soft_stop.leave(self)
             await self._persist_snapshot()
             await asyncio.shield(
                 asyncio.ensure_future(self.retire_own_background_work())
@@ -3537,6 +3543,9 @@ class QueryEngine:
         )
         restored_stage = snapshot.get("soft_stop_stage")
         self._soft_stop_stage = restored_stage if isinstance(restored_stage, str) else ""
+        from protocore.runtime import soft_stop as _soft_stop
+
+        _soft_stop.restore(self)
         from protocore.runtime.intent import IntentRecord
         from protocore.runtime.lanes import Lane
         from protocore.runtime.usage_ledger import UsageRow

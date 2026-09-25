@@ -412,22 +412,48 @@ async def test_a_wind_down_that_produced_no_answer_does_not_complete() -> None:
 
 @pytest.mark.asyncio
 async def test_the_notification_lands_in_history_as_the_runtimes_own_words() -> None:
-    """Marked synthetic, so it cannot be mistaken for the model answering."""
+    """Marked synthetic, so it cannot be mistaken for the model answering — and gone once the run is over."""
     rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "done"}])
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+    seen: list[list[Message]] = []
+
+    async for _ in engine.run(_user()):
+        seen.append(list(engine.history))
+
+    def notices(history: list[Message]) -> list[Message]:
+        return [
+            m
+            for m in history
+            if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+            == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+        ]
+
+    during = [n for h in seen for n in notices(h)]
+    assert during and all(n.role is MessageRole.user for n in during)
+    assert notices(engine.history) == []  # the run is over; the next one starts with its tools
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wind_down_does_not_leave_its_notice_behind() -> None:
+    """The notice told the model its tools were gone. A later run on the same history has them
+    back, and must not read an instruction to give up that was written for the run that failed."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        leader_tool_call_soft_cap=1,
+        soft_stop_max_turns=1,
+    )
+    llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
     async for _ in engine.run(_user()):
         pass
 
-    notices = [
-        m
+    assert engine.state is LoopState.FAILED
+    assert not any(
+        m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY) == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
         for m in engine.history
-        if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-        == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
-    ]
-    assert len(notices) == 1
-    assert notices[0].role is MessageRole.user
+    )
 
 
 @pytest.mark.asyncio
@@ -442,9 +468,10 @@ async def test_the_notification_is_bilingual_and_names_the_bound_that_was_hit() 
     async for _ in engine.run(_user()):
         pass
 
+    # The notice is gone from the finished run's history; the model read it in its last request.
     notice = next(
         m
-        for m in engine.history
+        for m in llm.calls[-1].messages
         if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
         == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
     )
