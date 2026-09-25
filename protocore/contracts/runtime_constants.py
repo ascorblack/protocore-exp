@@ -90,11 +90,17 @@ class LoopConstants(BaseModel):
             "proactive compaction reachable at all."
         ),
     )
-    compaction_routine_min_clear_ratio: float = Field(
-        default=0.5,
+    compaction_target_ratio: float = Field(
+        default=0.6,
         gt=0.0,
-        le=1.0,
-        description="Minimum input fraction the routine clear pass must reduce.",
+        lt=1.0,
+        description=(
+            "Where a compaction pass aims, as a fraction of the compaction "
+            "trigger: a pass that fires keeps compacting until the whole prompt "
+            "is at or below trigger x this ratio. The gap between the two is "
+            "the hysteresis that keeps the gate from firing again on the next "
+            "iteration: one pass buys room for many turns rather than one."
+        ),
     )
     compaction_emergency_ratio: float = Field(
         default=0.95,
@@ -582,54 +588,6 @@ class LoopConstants(BaseModel):
             "unit. 0 disables grouping."
         ),
     )
-    compaction_summary_min_words: int = Field(
-        default=25,
-        ge=1,
-        description=(
-            "Floor on the word budget handed to the per-turn summariser. The "
-            "budget is derived from the size of the unit being replaced, and "
-            "a small unit would otherwise be given a budget too small to hold "
-            "the identifiers the summary must keep verbatim."
-        ),
-    )
-    compaction_summary_output_tokens_per_word: int = Field(
-        default=4,
-        ge=1,
-        description=(
-            "Tokens one word of a summary is assumed to cost on the way OUT. "
-            "The word budget the summariser is asked for is capped at what "
-            "compaction_summary_max_output_tokens can hold at this rate. Two "
-            "is the figure for English prose; JSON escaping and a non-Latin "
-            "script (Cyrillic runs at three to four tokens a word) put a "
-            "budget sized that way past the output cap on every large unit, "
-            "and a summary the cap cuts off is never valid JSON, never parsed "
-            "and never committed — so the largest units are exactly the ones "
-            "that never shrink, and the next pass pays for them again."
-        ),
-    )
-    compaction_summary_envelope_tokens: int = Field(
-        default=32,
-        ge=0,
-        description=(
-            "Tokens of the summariser's output cap reserved for the JSON "
-            "around the words — the opening brace, the key, the quotes and "
-            "whatever escaping the text forces. Subtracted from the cap before "
-            "the word budget is derived, so a summary that spends its whole "
-            "stated budget still closes its envelope instead of being cut one "
-            "token short of valid JSON and discarded."
-        ),
-    )
-    compaction_summary_chars_per_word: int = Field(
-        default=6,
-        ge=1,
-        description=(
-            "Characters one word of a summary is assumed to cost, used to "
-            "restate the summariser's word budget in the prompt as a character "
-            "budget as well. A model holds to a length it can count directly "
-            "better than to a word count it has to estimate, and the budget "
-            "only bites when the reply would otherwise have been cut off."
-        ),
-    )
     compaction_summary_failed_unit_max_attempts: int = Field(
         default=2,
         ge=1,
@@ -640,16 +598,6 @@ class LoopConstants(BaseModel):
             "unit that fails the same way twice fails the same way every later "
             "pass, and the per-iteration gate would otherwise buy the same "
             "failure once an iteration. The fold tier still gets its turn at it."
-        ),
-    )
-    compaction_summary_tokens_per_word: int = Field(
-        default=6,
-        ge=1,
-        description=(
-            "Tokens of the original a summary may spend one word on: the word "
-            "budget in the summariser prompt is the unit's estimated size "
-            "divided by this. Room to keep identifiers, not enough to restate "
-            "the turn."
         ),
     )
     compaction_fold_enabled: bool = Field(
@@ -668,12 +616,14 @@ class LoopConstants(BaseModel):
         ),
     )
     compaction_fold_min_messages: int = Field(
-        default=8,
+        default=4,
         ge=2,
         description=(
             "A contiguous run of foldable messages (old summaries and old "
-            "operator turns) shorter than this is left alone: folding a "
-            "handful of summaries costs a summariser call and frees little."
+            "operator turns) shorter than this is left alone: folding two or "
+            "three summaries costs a summariser call and frees little. Low "
+            "enough that a pass which still needs room merges summaries before "
+            "the floor has to remove anything."
         ),
     )
     compaction_fold_min_tokens: int = Field(
@@ -701,6 +651,55 @@ class LoopConstants(BaseModel):
             "for the next pass, which is what keeps a single COMPACTING pause "
             "short on a history with many foldable runs."
         ),
+    )
+    compaction_mask_keep_recent_results: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Tool outputs among this many most recent are never masked by age. "
+            "Older outputs of at least compaction_mask_min_tokens are replaced "
+            "by a placeholder that names the tool and points at the stored "
+            "original, oldest first, when a pass needs the room. This is the "
+            "first tier: it needs no model and cannot fail."
+        ),
+    )
+    compaction_mask_min_tokens: int = Field(
+        default=300,
+        ge=0,
+        description=(
+            "A tool output smaller than this is not masked by age: its "
+            "placeholder would cost nearly as much as the output."
+        ),
+    )
+    compaction_mask_distinct_lines: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "How many of a masked output's distinct lines — lines whose shape, "
+            "numbers aside, the output does not repeat — its placeholder keeps "
+            "verbatim. They are where an output states a setting, an error or "
+            "a result once among repeated log lines. 0 keeps none."
+        ),
+    )
+    compaction_ledger_ratio: float = Field(
+        default=0.02,
+        gt=0.0,
+        le=0.2,
+        description=(
+            "Budget of the compaction ledger (exact values carried by code out "
+            "of compacted spans) as a fraction of model_context_window, "
+            "clamped to compaction_ledger_min_tokens..compaction_ledger_max_tokens."
+        ),
+    )
+    compaction_ledger_min_tokens: int = Field(
+        default=1_000,
+        gt=0,
+        description="Floor on the compaction ledger's budget, in tokens.",
+    )
+    compaction_ledger_max_tokens: int = Field(
+        default=6_000,
+        gt=0,
+        description="Ceiling on the compaction ledger's budget, in tokens.",
     )
     compaction_placeholder_preview_chars: int = Field(
         default=240,
@@ -1095,12 +1094,54 @@ class LoopConstants(BaseModel):
 
  # ----- Compaction LLM call caps -----
     compaction_summary_max_output_tokens: int = Field(
-        default=512,
+        default=2_048,
         gt=0,
         description=(
-            "Hard cap on the compaction-LLM's output for the per-turn "
-            "summariser call. Small enough that the summary fits in the "
-            "system_prompt budget."
+            "Ceiling on the output budget of one per-span summary, in tokens. "
+            "The budget itself is compaction_summary_ratio of what the summary "
+            "replaces, floored at compaction_summary_min_output_tokens; the "
+            "request is sent with twice the budget so a model that overshoots "
+            "is trimmed by the section clamp, at line boundaries, rather than "
+            "cut by the provider mid-sentence."
+        ),
+    )
+    compaction_summary_ratio: float = Field(
+        default=0.2,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Output budget of a summary as a fraction of the tokens it "
+            "replaces. Proportional so a small span is not asked for an essay "
+            "and a large one is not squeezed into a line."
+        ),
+    )
+    compaction_summary_min_output_tokens: int = Field(
+        default=256,
+        gt=0,
+        description=(
+            "Floor on a summary's output budget, so a small span still has "
+            "room for the exact values it carries. Never above the ceiling of "
+            "the kind of call it is."
+        ),
+    )
+    compaction_summariser_input_max_tokens: int = Field(
+        default=12_000,
+        gt=0,
+        description=(
+            "Ceiling on what one summariser call is shown, in tokens, and never "
+            "more than a quarter of model_context_window. A span larger than "
+            "this is rendered with its tool outputs cut at line boundaries "
+            "until it fits, so the summariser can always run, including right "
+            "after the provider refused a request as too long."
+        ),
+    )
+    compaction_summary_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0.0,
+        description=(
+            "Deadline for one summariser call. A call past it is abandoned and "
+            "counted as a failed summary, which compaction treats as a normal "
+            "outcome: the span stays, or the deterministic floor takes it."
         ),
     )
     compaction_summary_temperature: float = Field(
@@ -1112,32 +1153,14 @@ class LoopConstants(BaseModel):
             "Low value (0.2) keeps summaries deterministic + consistent."
         ),
     )
-    compaction_summary_string_max_chars: int = Field(
-        default=1024,
-        gt=0,
-        description=(
-            "JSON-schema ``maxLength`` cap on the summary string field. "
-            "Surfaced to XGrammar — enforces output bound at decode time."
-        ),
-    )
     compaction_fold_max_output_tokens: int = Field(
         default=3_000,
         gt=0,
         description=(
-            "Hard cap on the compaction-LLM's output for one fold summary. "
-            "Larger than the per-turn cap because a fold summary stands for "
-            "many turns at once; a fold that runs out of budget comes back "
-            "truncated and is discarded, so the pass paid for nothing."
-        ),
-    )
-    compaction_fold_summary_target_words: int = Field(
-        default=500,
-        ge=1,
-        description=(
-            "The word target stated in the fold prompt. It is what makes the "
-            "summariser merge repeated checks into one line and keep only the "
-            "last known state of each thing, rather than writing until the "
-            "output cap stops it mid-sentence."
+            "Ceiling on the output budget of one fold (a merge of earlier "
+            "summaries), in tokens. Larger than the per-span ceiling because a "
+            "fold stands for many spans at once. The budget is still "
+            "compaction_summary_ratio of what the fold replaces."
         ),
     )
 
@@ -3315,14 +3338,9 @@ class LoopConstants(BaseModel):
             if self.provider_reserves_output_in_context_window
             else 0.0
         )
- # the summariser must be able to spend the budget the prompt states: the
- # output cap has to hold the words plus the envelope around them
-        if self.compaction_summary_envelope_tokens >= (
-            self.compaction_summary_max_output_tokens
-        ):
+        if self.compaction_ledger_min_tokens > self.compaction_ledger_max_tokens:
             raise ValueError(
-                "compaction_summary_envelope_tokens must be < "
-                "compaction_summary_max_output_tokens"
+                "compaction_ledger_min_tokens must be <= compaction_ledger_max_tokens"
             )
         if output_reserve_ratio + self.compaction_trigger_turn_headroom_ratio >= 1.0:
             raise ValueError(

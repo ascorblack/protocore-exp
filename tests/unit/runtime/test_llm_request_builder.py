@@ -336,11 +336,11 @@ async def test_compaction_summariser_request_shape() -> None:
         compaction_keep_recent_turns=1,
     )
     llm = InMemoryLLMProvider()
-    llm.queue_response(text='{"summary": "they greeted each other"}')
+    llm.queue_response(text="## Progress\nthey greeted each other")
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="hello there " * 20)]),
         Message(
-            role=MessageRole.assistant, content_blocks=[TextBlock(text="hi back " * 20)]
+            role=MessageRole.assistant, content_blocks=[TextBlock(text="hi back " * 100)]
         ),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
@@ -356,8 +356,11 @@ async def test_compaction_summariser_request_shape() -> None:
     assert request.model == MODEL
     assert request.temperature == rc.compaction_summary_temperature
     assert list(request.tools) == []
-    assert request.max_tokens == rc.compaction_summary_max_output_tokens
-    assert request.extra == {}
+    # Twice the unit's budget, the budget being floored for a unit this small.
+    assert request.max_tokens == 2 * rc.compaction_summary_min_output_tokens
+    # A summary is written, not reasoned towards: thinking is asked off.
+    assert request.extra == {"enable_thinking": False, "reasoning_effort": "low"}
+    assert [m.role for m in request.messages] == [MessageRole.system, MessageRole.user]
 
 
 async def test_compaction_summariser_skips_a_known_oversized_request() -> None:

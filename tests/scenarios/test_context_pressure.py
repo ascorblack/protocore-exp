@@ -327,7 +327,6 @@ async def test_pressure_the_first_pass_cannot_absorb_is_summarised(
         rc=_compacting_rc(
             model_context_window=4_096,
             compaction_trigger_ratio=0.3,
-            compaction_routine_min_clear_ratio=1.0,
         ),
     )
     for index in range(2):
@@ -384,7 +383,7 @@ def _shedding_rc() -> object:
     is set where that tier alone relieves the pressure.
     """
     return default_rc(
-        model_context_window=2_000,
+        model_context_window=3_000,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )

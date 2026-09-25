@@ -155,6 +155,7 @@ from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
+    compaction_event_payload,
     current_tool_batch_protect_index,
 )
 from protocore.runtime.context.manager import ContextBundle
@@ -2690,6 +2691,7 @@ async def _run_compaction(
             protect_tail_from_index=protect_tail_from_index,
             record_request=_record_summariser_request,
             llm_tiers=llm_tiers,
+            overhead_tokens=engine.request_overhead_tokens(),
         )
     except CompactionExhaustedError as exc:
         # The transaction opened at ``pre_compact`` and cannot close on
@@ -2728,15 +2730,7 @@ async def _run_compaction(
     yield TurnEvent(
         type=EventType.COMPACTION_COMPLETED,
         run_id=engine.config.run_id,
-        payload={
-            "reason": reason,
-            "tokens_before": attempt.tokens_before,
-            "tokens_after": attempt.tokens_after,
-            "tier1_freed": attempt.tier1.tokens_freed if attempt.tier1 else 0,
-            "tier2_summarised": attempt.tier2.turns_summarised if attempt.tier2 else 0,
-            "tier3_folded": attempt.tier3.messages_folded if attempt.tier3 else 0,
-            "blob_refs_created": (list(attempt.tier1.blob_refs_created) if attempt.tier1 else []),
-        },
+        payload=compaction_event_payload(attempt, reason=reason),
     )
     _commit, commit_evt = await fire_lifecycle(
         engine,
@@ -5665,6 +5659,7 @@ async def _handle_context_window_exceeded(
                 call_category="compaction",
             ),
             reactive=True,
+            overhead_tokens=engine.request_overhead_tokens(),
         )
     except CompactionExhaustedError as inner_exc:
         if retry_strictly_shrinks and not attempts_exhausted:
@@ -5714,15 +5709,7 @@ async def _handle_context_window_exceeded(
     yield TurnEvent(
         type=EventType.COMPACTION_COMPLETED,
         run_id=engine.config.run_id,
-        payload={
-            "reason": "reactive_413",
-            "tokens_before": attempt.tokens_before,
-            "tokens_after": attempt.tokens_after,
-            "tier1_freed": attempt.tier1.tokens_freed if attempt.tier1 else 0,
-            "tier2_summarised": attempt.tier2.turns_summarised if attempt.tier2 else 0,
-            "tier3_folded": attempt.tier3.messages_folded if attempt.tier3 else 0,
-            "blob_refs_created": (list(attempt.tier1.blob_refs_created) if attempt.tier1 else []),
-        },
+        payload=compaction_event_payload(attempt, reason="reactive_413"),
     )
     # This path calls force_compaction directly (not via _run_compaction), so
     # clear the diagnostic scalar here too: it describes the request before

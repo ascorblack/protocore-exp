@@ -618,11 +618,11 @@ class TestLoopGroup:
         assert spec.exclusive_maximum is True
         assert spec.kind == "float"
 
-    def test_summary_output_cost_per_word_is_dashboard_configurable(self) -> None:
-        spec = build_loop_group().spec("compaction_summary_output_tokens_per_word")
-        assert spec.default == 4
-        assert spec.minimum == 1.0
-        assert spec.kind == "int"
+    def test_summary_budget_ratio_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_ratio")
+        assert spec.default == 0.2
+        assert spec.maximum == 1.0
+        assert spec.kind == "float"
 
     def test_failed_unit_attempt_bound_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("compaction_summary_failed_unit_max_attempts")
@@ -647,22 +647,20 @@ class TestLoopGroup:
         assert growth.minimum == 0.0 and growth.exclusive_minimum is True
         assert growth.kind == "float"
 
-    def test_summary_chars_per_word_is_dashboard_configurable(self) -> None:
-        spec = build_loop_group().spec("compaction_summary_chars_per_word")
-        assert spec.default == 6
-        assert spec.minimum == 1.0
-        assert spec.kind == "int"
+    def test_compaction_target_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_target_ratio")
+        assert spec.default == 0.6
+        assert spec.kind == "float"
 
     def test_output_reserve_gate_is_dashboard_configurable(self) -> None:
         spec = build_loop_group().spec("provider_reserves_output_in_context_window")
         assert spec.default is True
         assert spec.kind == "bool"
 
-    def test_summary_envelope_allowance_is_dashboard_configurable(self) -> None:
-        spec = build_loop_group().spec("compaction_summary_envelope_tokens")
-        assert spec.default == 32
-        assert spec.minimum == 0.0
-        assert spec.kind == "int"
+    def test_summariser_deadline_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_timeout_seconds")
+        assert spec.default == 120.0
+        assert spec.kind == "float"
 
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")

@@ -6,6 +6,48 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Compaction ends below its trigger or at a floor, whatever the summariser
+  does.** A pass now masks old tool outputs, summarises the oldest spans,
+  folds old summaries, and — when those stop short — removes the oldest spans
+  without a model, until the whole prompt is at `compaction_target_ratio` of
+  the trigger or nothing removable is left. A summariser that fails, hangs,
+  returns nothing or returns something unparseable is a normal outcome, and a
+  pass that could change nothing is not opened. See `docs/compaction.md`.
+- **A summary is plain text under five fixed headings**, requested with
+  `complete_text` under a system-role instruction, read tolerantly (a JSON
+  envelope, an unterminated one, a reply without headings and a reply the
+  output cap cut are all kept) and clamped section by section at line
+  boundaries. The single JSON `summary` string and its 1,024-character ceiling
+  are gone.
+- **Exact values are carried by code.** Every tier records what it takes out
+  of the window — operator instructions, files touched, identifiers of
+  recognisable shape with their line, failed calls, the latest plan — in one
+  ledger message, rebuilt by code on every pass and never shown to the
+  summariser.
+- **Old tool outputs are masked by age** (`compaction_mask_keep_recent_results`,
+  `compaction_mask_min_tokens`), keeping the lines the output said only once
+  (`compaction_mask_distinct_lines`) and a readable pointer to the stored
+  original. The summariser is shown a masked output in full.
+- **Adjacent units are summarised as one span** up to
+  `compaction_summary_group_max_tokens`, whatever their size, and a span's
+  output budget is `compaction_summary_ratio` of it, clamped by
+  `compaction_summary_min_output_tokens` and `compaction_summary_max_output_tokens`
+  (now 2,048). The summariser's input is bounded
+  (`compaction_summariser_input_max_tokens`, and a quarter of the window) and
+  each call has a deadline (`compaction_summary_timeout_seconds`).
+- **`compaction_completed` reports every tier and the pass's `outcome`**, and
+  the whole prompt before and after; `compaction_fold_min_messages` is now 4.
+
+### Removed
+
+- `compaction_routine_min_clear_ratio` (replaced by `compaction_target_ratio`),
+  `compaction_summary_string_max_chars`, `compaction_summary_envelope_tokens`,
+  `compaction_summary_chars_per_word`, `compaction_summary_output_tokens_per_word`,
+  `compaction_summary_tokens_per_word`, `compaction_summary_min_words` and
+  `compaction_fold_summary_target_words`: they sized a JSON string in words.
+
 ### Fixed
 
 - **A compaction the `pre_compact` hook refuses leaves the run running.** The

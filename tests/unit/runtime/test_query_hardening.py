@@ -837,14 +837,28 @@ class _DeadSummariser(_ScriptedFailureLLM):
         super().__init__(exceptions=[])
         self.summary_calls = 0
 
-    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+    async def complete_text(self, request):  # type: ignore[no-untyped-def]
         self.summary_calls += 1
         raise RuntimeError("summariser unavailable")
 
 
+def _floor_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the floor out of the cascade, so a pass can end with nothing done.
+
+    With the floor in place a pass whose summariser fails still removes the
+    oldest spans, which is the point of it; the exhaustion paths below are
+    what is left when even that fails.
+    """
+
+    async def _raises(*_: object, **__: object) -> None:
+        raise RuntimeError("floor unavailable")
+
+    monkeypatch.setattr("protocore.runtime.context.manager.run_floor", _raises)
+
+
 @pytest.mark.asyncio
 async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_ladder(
-    engine_factory, in_memory_runtime
+    engine_factory, in_memory_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reactive pass out of budget must not end a run the cap ladder can still save.
 
@@ -888,6 +902,7 @@ async def test_an_exhausted_compaction_budget_hands_the_turn_back_to_the_cap_lad
         ]
     )
     engine.compaction_state.reactive_retry_count = rc.compaction_failed_max_retries
+    _floor_unavailable(monkeypatch)
 
     events = [
         event
@@ -1384,9 +1399,10 @@ async def test_a_proactive_pass_that_freed_nothing_does_not_forfeit_reactive_com
 
 @pytest.mark.asyncio
 async def test_force_compaction_exhaustion_raises(
-    in_memory_runtime,
+    in_memory_runtime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Repeated force_compaction failures raise :class:`CompactionExhaustedError`."""
+    _floor_unavailable(monkeypatch)
     from protocore.runtime.context.compaction import (
         CompactionExhaustedError,
         CompactionState,
@@ -1405,7 +1421,7 @@ async def test_force_compaction_exhaustion_raises(
             raise NotImplementedError
             yield
 
-        async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        async def complete_text(self, request):  # type: ignore[no-untyped-def]
             raise RuntimeError("summariser is dead")
 
         def count_tokens(self, text, model=None) -> int:  # type: ignore[no-untyped-def]
@@ -3977,6 +3993,7 @@ async def test_proactive_exhaustion_suspends_proactive_compaction_instead_of_fai
     )
     engine.compaction_state.retry_count = rc.compaction_failed_max_retries
     monkeypatch.setattr(engine, "needs_emergency_compaction", lambda: True)
+    _floor_unavailable(monkeypatch)
 
     events = [
         event
@@ -3997,13 +4014,19 @@ async def test_proactive_exhaustion_suspends_proactive_compaction_instead_of_fai
     assert reasons.count("compaction_exhausted_proactive_suspended") == 1
     assert engine.proactive_compaction_suspended is True
 
-    # Suspended: the next gate is not opened, and makes no summariser call.
+    # Suspended: the next gate makes no summariser call. It may still open —
+    # the floor needs no summariser and is not suspended with it.
     calls_before = summariser.summary_calls
     from protocore.runtime.query import _run_compaction
 
     engine.state = LoopState.RUNNING
-    assert [event async for event in _run_compaction(engine, force=True)] == []
+    events = [event async for event in _run_compaction(engine, force=True)]
     assert summariser.summary_calls == calls_before
+    assert all(
+        event.payload.get("tier2_attempted", 0) == 0
+        for event in events
+        if event.type is EventType.COMPACTION_COMPLETED
+    )
 
 
 @pytest.mark.asyncio

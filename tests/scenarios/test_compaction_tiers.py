@@ -15,7 +15,6 @@ snapshot.
 from __future__ import annotations
 
 import asyncio
-import json
 import random
 from typing import Any
 
@@ -43,9 +42,7 @@ class Summariser(InMemoryLLMProvider):
         self.peak_in_flight = 0
         self._in_flight = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> Any:
+    async def complete_text(self, request: LLMRequest) -> Any:
         self._in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
         try:
@@ -53,15 +50,15 @@ class Summariser(InMemoryLLMProvider):
             # coroutine in the batch would run to completion before the next
             # one started and the fan-out would be invisible.
             await asyncio.sleep(0)
-            self.queue_response(text=json.dumps({"summary": self.summary}))
-            return await super().complete_structured(request, response_schema)
+            self.queue_response(text=f"## Progress\n{self.summary}")
+            return await super().complete_text(request)
         finally:
             self._in_flight -= 1
 
     @property
     def prompts(self) -> list[str]:
-        """What the summariser was asked, one string per call."""
-        return [call.messages[0].text for call in self.calls]
+        """What the summariser was shown, instruction and material, one string per call."""
+        return ["\n".join(message.text for message in call.messages) for call in self.calls]
 
 
 def _tiered_rc(**overrides: Any) -> Any:
@@ -126,9 +123,14 @@ async def test_a_long_conversation_crosses_all_three_compaction_tiers(
     """
     summariser = Summariser()
     tool = ScriptedTool(tool_name="Note", content="R" * 4_000)
-    run = scenario(rc=_tiered_rc(), tools=[tool], compaction_provider=summariser)
+    # A window in which the kept tail and the batch in flight leave the tiers
+    # room to work: in a smaller one the floor takes everything outside them
+    # on every pass and no run of summaries ever forms for the fold.
+    run = scenario(
+        rc=_tiered_rc(model_context_window=8_192), tools=[tool], compaction_provider=summariser
+    )
 
-    await _long_conversation(run, turns=14, tool=tool)
+    await _long_conversation(run, turns=20, tool=tool)
 
     completions = [
         evt.payload for evt in run.events_of(EventType.COMPACTION_COMPLETED)
@@ -145,9 +147,14 @@ async def test_the_fold_leaves_one_message_standing_for_many(
     """What the fold buys is a shorter transcript, not merely a shorter tier list."""
     summariser = Summariser()
     tool = ScriptedTool(tool_name="Note", content="R" * 4_000)
-    run = scenario(rc=_tiered_rc(), tools=[tool], compaction_provider=summariser)
+    # A window in which the kept tail and the batch in flight leave the tiers
+    # room to work: in a smaller one the floor takes everything outside them
+    # on every pass and no run of summaries ever forms for the fold.
+    run = scenario(
+        rc=_tiered_rc(model_context_window=8_192), tools=[tool], compaction_provider=summariser
+    )
 
-    await _long_conversation(run, turns=14, tool=tool)
+    await _long_conversation(run, turns=20, tool=tool)
 
     folded = [
         payload["tier3_folded"]
@@ -234,13 +241,14 @@ async def test_every_identifier_reaches_the_summariser_verbatim(
         )
         await run.run(f"step {index}: keep going")
 
-    per_turn = [p for p in summariser.prompts if p.lstrip().startswith("<turn>")]
+    per_turn = [p for p in summariser.prompts if "You write the compaction summary" in p]
     assert per_turn, "nothing was summarised, so nothing was proved"
     seen = "\n".join(summariser.prompts)
     for identifier in identifiers:
         assert identifier in seen, f"{identifier!r} never reached the summariser"
     assert all(
-        "verbatim" in prompt and "never round, guess or substitute" in prompt
+        "copied character for character" in prompt
+        and "Never round, shorten, translate or guess a value" in prompt
         for prompt in per_turn
     )
 
@@ -260,11 +268,11 @@ async def test_the_summariser_is_told_that_a_missing_result_is_an_unknown(
 
     await _long_conversation(run, turns=8, tool=tool)
 
-    per_turn = [p for p in summariser.prompts if p.lstrip().startswith("<turn>")]
+    per_turn = [p for p in summariser.prompts if "You write the compaction summary" in p]
     assert per_turn
-    assert all("state unknowns as unknown" in prompt for prompt in per_turn)
-    folds = [p for p in summariser.prompts if p.lstrip().startswith("<turns>")]
-    assert all("state unknown outcomes as unknown" in prompt for prompt in folds)
+    assert all("An outcome the material does not show is unknown" in prompt for prompt in per_turn)
+    folds = [p for p in summariser.prompts if "You merge the compaction summaries" in p]
+    assert all("An outcome the items do not show is unknown" in prompt for prompt in folds)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +292,7 @@ async def test_summariser_calls_are_bounded_by_the_configured_width(
     summariser = Summariser()
     tool = ScriptedTool(tool_name="Note", content="R" * 4_000)
     run = scenario(
-        rc=_tiered_rc(compaction_summariser_parallelism=2),
+        rc=_tiered_rc(compaction_summariser_parallelism=2, compaction_summary_group_max_tokens=0),
         tools=[tool],
         compaction_provider=summariser,
     )
@@ -361,12 +369,10 @@ class RefusingSummariser(InMemoryLLMProvider):
 
     def __init__(self) -> None:
         super().__init__()
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> Any:
-        self.structured_calls += 1
+    async def complete_text(self, request: LLMRequest) -> Any:
+        self.text_calls += 1
         raise LLMContextWindowExceeded("the unit does not fit the summariser")
 
 

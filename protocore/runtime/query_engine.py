@@ -1471,6 +1471,7 @@ class QueryEngine:
             blob_store=blob_store,
             compaction_llm=self.compaction_llm,
             prompts=self.prompt_provider,
+            tool_roles=config.tool_roles,
         )
 
     # ------------------------------------------------------------------

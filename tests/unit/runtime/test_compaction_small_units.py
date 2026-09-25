@@ -48,17 +48,15 @@ class _Summariser(InMemoryLLMProvider):
         super().__init__()
         self.prompts: list[str] = []
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        prompt = request.messages[-1].text
-        self.prompts.append(prompt)
-        allowed = int(re.search(r"about (\d+) characters", prompt).group(1))  # type: ignore[union-attr]
-        summary = ("checked one case, exit 0; " * 400)[: int(allowed * 0.6)]
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        instruction = request.messages[0].text
+        self.prompts.append(request.messages[-1].text)
+        allowed = int(re.search(r"about (\d+) words", instruction).group(1))  # type: ignore[union-attr]
+        words = ("checked one case, exit 0; " * 400).split()[: int(allowed * 0.6)]
         return LLMResponse(
             message=Message(
                 role=MessageRole.assistant,
-                content_blocks=[TextBlock(text=json.dumps({"summary": summary}))],
+                content_blocks=[TextBlock(text="## Progress\n" + " ".join(words))],
             ),
             stop_reason=StopReason.end_turn,
         )

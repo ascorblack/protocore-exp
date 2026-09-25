@@ -504,6 +504,53 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
         "hands the whole transcript to the Tier-3 fold after Tier-2"
     ),
+    "protocore/runtime/context/manager.py::ContextManager._run_pass": _whole(
+        "runs every tier of one compaction pass over the whole transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_age_mask_candidates": _whole(
+        "ranks tool outputs by age across the whole transcript to find the old ones"
+    ),
+    "protocore/runtime/context/compaction.py::_bounded_span": _whole(
+        "measures a run of positions of the transcript against the summariser's input cap"
+    ),
+    "protocore/runtime/context/compaction.py::_floor_units": _whole(
+        "partitions everything outside the protected set, whichever run wrote it"
+    ),
+    "protocore/runtime/context/compaction.py::floor_has_work": _whole(
+        "asks, without removing anything, whether the floor has a span to remove"
+    ),
+    "protocore/runtime/context/compaction.py::run_floor": _whole(
+        "removes the oldest spans of the whole transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_ledger_position": _whole(
+        "finds the boundary between the compacted past and the kept present"
+    ),
+    "protocore/runtime/context/compaction.py::place_ledger": _whole(
+        "replaces every ledger message in the transcript with one rebuilt from state"
+    ),
+    "protocore/runtime/context/ledger.py::ledger_from_history": _whole(
+        "merges every ledger message the transcript carries, whichever run wrote it"
+    ),
+    "protocore/runtime/context/compaction.py::render_span_for_summary": _Declaration(
+        reason="renders one span a pass is about to replace, for the summariser",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_originals_for": _Declaration(
+        reason="reads back the stored outputs of one span a pass is about to replace",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_store_originals": _Declaration(
+        reason="stores the messages one summary or digest replaces",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/compaction.py::_floor_digest": _Declaration(
+        reason="describes the span the floor is removing",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/runtime/context/ledger.py::Ledger.absorb": _Declaration(
+        reason="records the messages one tier is taking out of the window",
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
     # --- building the seed, from messages the caller supplies ---------------
     "protocore/runtime/context/session_memory.py::_serialize_turns": _whole(
         "renders the turns it is handed; it reaches no engine"
@@ -1522,6 +1569,15 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     ),
     "protocore/runtime/context/compaction.py::_fold_item_text": (
         "labels one indexed message for the fold summariser by its provenance"
+    ),
+    "protocore/runtime/context/compaction.py::_floor_units": (
+        "reactive recovery lets the floor remove an earlier run's turns but "
+        "never in one span with this run's, which is a per-message provenance "
+        "test on the list it partitions"
+    ),
+    "protocore/runtime/context/compaction.py::run_floor": (
+        "the digest that replaces an earlier run's turns keeps their seed tag, "
+        "read per message from the span being removed"
     ),
     "protocore/runtime/context/compaction.py::run_tier3_fold": (
         "reactive folding transfers seed provenance from each indexed span"

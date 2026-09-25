@@ -88,9 +88,10 @@ def parse_compacted_placeholder(text: str) -> tuple[CompactionSourceRef, Compact
     :func:`render_compacted_placeholder`. Tolerates legacy 5-field
     placeholders (no trailing tool_name/preview fields), and an empty digest —
     which is what a placeholder says when it points at bytes whose hash the
-    writer had no honest way to state.
+    writer had no honest way to state. Only the first line is the frame:
+    compaction follows it with a line written for the model to read.
     """
-    match = _PARSE_RE.match(text.strip())
+    match = _PARSE_RE.match(text.strip().split("\n", 1)[0])
     if not match:
         return None
     tool_name_token = match.group("tool_name") or ""

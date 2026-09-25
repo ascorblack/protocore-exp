@@ -583,15 +583,14 @@ async def test_compaction_uses_rc_for_summary_caps(
     """Compaction Tier 2 LLMRequest MUST source caps from RC, not magic numbers.
 
  Regression: ``compaction.py`` hardcoded ``max_tokens=512`` and
- ``temperature=0.2``; the JSON schema ``maxLength`` was bare ``1024``.
- All three MUST be sourced from RC fields (no inline magic numbers). This test inspects the
- ``InMemoryLLMProvider.calls`` view to verify the Tier 2 path picked
- them up correctly.
+ ``temperature=0.2``. Both MUST be sourced from RC fields (no inline magic
+ numbers): the request cap from the summary budget, which is capped by
+ ``compaction_summary_max_output_tokens``, and the temperature from
+ ``compaction_summary_temperature``. This test inspects the
+ ``InMemoryLLMProvider.calls`` view to verify the Tier 2 path picked them up.
  """
     from protocore.contracts.runtime_constants import LoopConstants
-    from protocore.runtime.context.compaction import (
-        build_summary_schema,
-    )
+    from protocore.runtime.context.carrier import request_max_tokens
 
     rc = LoopConstants(
         model_context_window=64,
@@ -600,19 +599,12 @@ async def test_compaction_uses_rc_for_summary_caps(
         compaction_keep_recent_turns=1,
         # Custom caps — values different from defaults so we can assert.
         compaction_summary_max_output_tokens=64,
+        compaction_summary_min_output_tokens=32,
         compaction_summary_temperature=0.5,
-        compaction_summary_string_max_chars=128,
     )
-
-    # Verify the schema builder picks up the RC field.
-    schema = build_summary_schema(rc)
-    assert schema["properties"]["summary"]["maxLength"] == 128
 
     engine = engine_factory(rc=rc)
     in_memory_runtime["llm"].queue_response(text="ok")  # primary turn
-    # Force Tier 2 by giving long history — InMemoryLLMProvider falls back
-    # to default behaviour for compaction summariser; the call goes
-    # through ``complete_structured`` so we'd need to assert via call log.
     big_text = "z" * 1024
     user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text=big_text)])
     async for _ in engine.run(user_msg):
@@ -621,15 +613,13 @@ async def test_compaction_uses_rc_for_summary_caps(
     # Verify the compaction LLM saw a request with the RC-sourced caps.
     summariser_calls = [
         req for req in in_memory_runtime["llm"].calls
-        if req.max_tokens == rc.compaction_summary_max_output_tokens
-        and req.temperature == rc.compaction_summary_temperature
+        if req.messages and req.messages[0].role is MessageRole.system
     ]
     # Tier 2 may not fire if Tier 1 freed enough; gate the assertion on
     # whether the summariser was invoked.
-    if summariser_calls:
-        for req in summariser_calls:
-            assert req.max_tokens == 64
-            assert req.temperature == 0.5
+    for req in summariser_calls:
+        assert req.max_tokens <= request_max_tokens(rc.compaction_summary_max_output_tokens)
+        assert req.temperature == 0.5
 
 
 @pytest.mark.asyncio

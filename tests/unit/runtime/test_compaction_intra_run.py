@@ -203,7 +203,12 @@ async def test_tier1_placeholder_enriched_from_originating_tool() -> None:
     assert parsed is not None
     ref, _ = parsed
     assert ref.tool_name == "Bash"  # originating tool surfaced
-    assert ref.preview  # non-empty preview breadcrumb
+    # The preview is for the model, so it is written where the model can read
+    # it — the line under the frame — not base64-encoded inside it.
+    assert ref.preview == ""
+    readable = block.content.split("\n", 1)[1]
+    assert "output of Bash" in readable
+    assert "First and last lines:" in readable
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +398,7 @@ def _summary_history() -> list[Message]:
     # user turn (idx 0) is the protected task.
     return [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="the task")]),
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="aged answer " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="aged answer " * 60)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
 
@@ -427,7 +432,7 @@ async def test_resume_does_not_resummarise() -> None:
     # already-summarised turn must NOT be re-summarised.
     resumed_history.insert(
         len(resumed_history) - 1,
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="newly aged " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="newly aged " * 60)]),
     )
 
     llm2 = InMemoryLLMProvider()
@@ -505,7 +510,8 @@ async def test_tier2_drops_aged_synthetic_nudge_without_summarising_it() -> None
         model_name="m",
     )
 
-    assert result.turns_summarised == 2
+    # With the nudge gone the two answers are adjacent, and one span.
+    assert result.turns_summarised == 1
     assert result.tokens_freed > 0
     assert all(marker not in message.text for message in history)
     assert history[0].text == "real task"
@@ -558,7 +564,7 @@ async def test_tier2_provider_failure_keeps_the_deterministic_cleanup() -> None:
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
     class FailingSummaryLLM(InMemoryLLMProvider):
-        async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        async def complete_text(self, request):  # type: ignore[no-untyped-def]
             raise RuntimeError("summary unavailable")
 
     history = [
@@ -732,7 +738,11 @@ async def test_duplicate_tool_call_turns_each_summarised() -> None:
     # keep_recent=2 protects the two trailing user turns; the first user turn
     # (the task) is protected by compaction_protect_first_user_turn. That leaves
     # BOTH A/R units (indices {1,2} and {3,4}) eligible.
-    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=2)
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=2,
+        compaction_summary_group_max_tokens=0,
+    )
     history = _spiral_history()
     llm = InMemoryLLMProvider()
     llm.queue_response(text="SUMMARY-1")
@@ -1431,7 +1441,7 @@ async def test_tier2_summary_replacement_is_user_role_with_flag() -> None:
     llm.queue_response(text="User asked X; assistant did Y.")
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="the original task " * 8)]),
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="aged answer " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="aged answer " * 60)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     result = await run_tier2_summarisation(

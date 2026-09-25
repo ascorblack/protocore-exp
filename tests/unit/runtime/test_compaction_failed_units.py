@@ -35,6 +35,8 @@ def _rc(**overrides: Any) -> LoopConstants:
         "compaction_protect_first_user_turn": False,
         "compaction_summary_min_unit_tokens": 0,
         "compaction_summariser_parallelism": 4,
+        # The census is per unit: one unit, one call.
+        "compaction_summary_group_max_tokens": 0,
     }
     base.update(overrides)
     return LoopConstants(**base)
@@ -58,12 +60,10 @@ class _Raising(InMemoryLLMProvider):
 
     def __init__(self) -> None:
         super().__init__()
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        self.structured_calls += 1
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        self.text_calls += 1
         raise LLMContextWindowExceeded("this unit does not fit")
 
 
@@ -72,12 +72,10 @@ class _Flaky(InMemoryLLMProvider):
 
     def __init__(self) -> None:
         super().__init__()
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        self.structured_calls += 1
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        self.text_calls += 1
         raise RuntimeError("429 Too Many Requests")
 
 
@@ -86,12 +84,10 @@ class _EmptyReply(InMemoryLLMProvider):
 
     def __init__(self) -> None:
         super().__init__()
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        self.structured_calls += 1
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        self.text_calls += 1
         return LLMResponse(
             message=Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="")]),
             stop_reason=StopReason.max_tokens,
@@ -103,12 +99,10 @@ class _NoSmaller(InMemoryLLMProvider):
 
     def __init__(self) -> None:
         super().__init__()
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        self.structured_calls += 1
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        self.text_calls += 1
         return LLMResponse(
             message=Message(
                 role=MessageRole.assistant,
@@ -126,13 +120,11 @@ class _OneUnitFails(InMemoryLLMProvider):
     def __init__(self, marker: str) -> None:
         super().__init__()
         self._marker = marker
-        self.structured_calls = 0
+        self.text_calls = 0
 
-    async def complete_structured(
-        self, request: LLMRequest, response_schema: dict[str, Any]
-    ) -> LLMResponse:
-        self.structured_calls += 1
-        if self._marker in request.messages[0].text:
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        self.text_calls += 1
+        if self._marker in request.messages[-1].text:
             raise LLMContextWindowExceeded("this unit never fits")
         return LLMResponse(
             message=Message(
@@ -157,7 +149,7 @@ async def test_a_unit_the_summariser_cannot_fit_is_left_alone_after_the_limit() 
         assert result.turns_summarised == 0
 
     # Two passes paid for the failure; the two after them did not.
-    assert llm.structured_calls == 2
+    assert llm.text_calls == 2
     assert list(state.failed_anchor_keys.values()) == [2]
     assert history[-1].text == "recent"
 
@@ -176,7 +168,7 @@ async def test_a_reply_with_no_summary_in_it_counts_as_a_failed_call() -> None:
             history=history, compaction_llm=llm, state=state, rc=rc, model_name="mock"
         )
 
-    assert llm.structured_calls == 1
+    assert llm.text_calls == 1
     assert list(state.failed_anchor_keys.values()) == [1]
 
 
@@ -196,7 +188,7 @@ async def test_a_summary_that_is_merely_no_smaller_is_not_held_against_the_unit(
         )
         assert result.turns_summarised == 0
 
-    assert llm.structured_calls == 3
+    assert llm.text_calls == 3
     assert state.failed_anchor_keys == {}
 
 
@@ -242,11 +234,11 @@ async def test_the_failure_census_survives_a_snapshot_round_trip() -> None:
     )
     assert list(rehydrated.failed_anchor_keys.values()) == [2]
 
-    calls_so_far = llm.structured_calls
+    calls_so_far = llm.text_calls
     await run_tier2_summarisation(
         history=history, compaction_llm=llm, state=rehydrated, rc=rc, model_name="mock"
     )
-    assert llm.structured_calls == calls_so_far
+    assert llm.text_calls == calls_so_far
 
 
 @pytest.mark.asyncio
@@ -267,7 +259,7 @@ async def test_a_transport_failure_is_not_held_against_the_unit() -> None:
 
     assert state.failed_anchor_keys == {}
     # Every pass still tried every unit.
-    assert llm.structured_calls == 9
+    assert llm.text_calls == 9
 
 
 @pytest.mark.asyncio
@@ -285,11 +277,11 @@ async def test_a_forced_pass_tries_the_units_the_routine_gate_has_written_off() 
     assert list(state.failed_anchor_keys.values()) == [1]
 
     # The routine gate now skips it.
-    calls_after_first = llm.structured_calls
+    calls_after_first = llm.text_calls
     await run_tier2_summarisation(
         history=history, compaction_llm=llm, state=state, rc=rc, model_name="mock"
     )
-    assert llm.structured_calls == calls_after_first
+    assert llm.text_calls == calls_after_first
 
     # The forced pass does not.
     await run_tier2_summarisation(
@@ -300,7 +292,7 @@ async def test_a_forced_pass_tries_the_units_the_routine_gate_has_written_off() 
         model_name="mock",
         retry_failed_units=True,
     )
-    assert llm.structured_calls == calls_after_first + 1
+    assert llm.text_calls == calls_after_first + 1
 
 
 @pytest.mark.asyncio

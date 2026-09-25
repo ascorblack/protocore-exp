@@ -489,6 +489,8 @@ async def test_a_run_that_compacted_records_the_summariser_call_and_replays() ->
         model_context_window=4_096,
         compaction_trigger_ratio=0.2,
         compaction_keep_recent_turns=1,
+        # One summary per answer, so the recording holds one call per turn.
+        compaction_summary_group_max_tokens=0,
     )
     summary = "the old turns, summarised"
 

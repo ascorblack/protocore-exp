@@ -15,6 +15,7 @@ from protocore.contracts.llm import ILLMProvider, LLMObservabilityContext
 from protocore.contracts.prompts import IPromptTemplateProvider
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.skills import SkillBundle
+from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRoleMap
 from protocore.contracts.types import Message, ToolDefinition
 from protocore.logging_utils import get_logger
 from protocore.runtime.context.budgets import TokenBudgets, derive_budgets
@@ -28,6 +29,9 @@ from protocore.runtime.context.compaction import (
     Tier3Result,
     TokenEstimator,
     estimate_history_tokens,
+    floor_has_work,
+    place_ledger,
+    run_floor,
     run_tier1_truncation,
     run_tier2_summarisation,
     run_tier3_fold,
@@ -35,7 +39,8 @@ from protocore.runtime.context.compaction import (
     tier2_has_work,
     tier3_has_work,
 )
-from protocore.runtime.token_counting import LanguageProfile, detect_profile
+from protocore.runtime.context.ledger import Ledger, is_ledger, ledger_from_history
+from protocore.runtime.token_counting import LanguageProfile, detect_profile, estimate_tokens
 
 _logger = get_logger(__name__)
 
@@ -99,8 +104,12 @@ class ContextManager:
         blob_store: IBlobStore,
         compaction_llm: ILLMProvider,
         prompts: IPromptTemplateProvider | None = None,
+        tool_roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
     ) -> None:
         self._rc = rc
+        # What the host's tools do, so the ledger can say a file was written
+        # rather than merely named.
+        self._tool_roles = tool_roles
         self._blob_store = blob_store
         self._compaction_llm = compaction_llm
         # The provider that renders the summariser instructions. ``None`` is a
@@ -266,6 +275,8 @@ class ContextManager:
         *,
         keep_recent_turns: int | None = None,
         compact_seeded_history: bool = False,
+        tenant_id: str = "",
+        ledger: Ledger | None = None,
     ) -> Tier3Result | None:
         """Tier 3, after Tier 2 in both cascades.
 
@@ -292,6 +303,10 @@ class ContextManager:
                 prompts=self._prompts,
                 keep_recent_turns=keep_recent_turns,
                 compact_seeded_history=compact_seeded_history,
+                blob_store=self._blob_store,
+                tenant_id=tenant_id,
+                ledger=ledger,
+                roles=self._tool_roles,
             )
         except Exception as exc:
             _logger.warning("tier3 fold failed; skipping (err=%s)", exc)
@@ -312,30 +327,31 @@ class ContextManager:
 
         A pass ends in one of three ways:
 
-        * **progress** — it freed tokens, or rewrote, summarised or folded
-          anything. Both budgets are cleared, whichever profile made it: the
-          history the next pass of either kind faces is a different one.
+        * **progress** — it freed tokens, or masked, summarised, folded or
+          removed anything. Both budgets are cleared, whichever profile made
+          it: the history the next pass of either kind faces is a different one.
         * **nothing to do** — no tier raised and no tier found anything it was
-          allowed to touch under this pass's profile: Tier 1 modified nothing,
-          Tier 2 sent no unit and Tier 3 no span. A proactive pass over a
-          history of seeded turns lands here by design. It spends nothing:
-          there was no attempt to fail.
-        * **failed** — a tier raised, or a summariser call was made and nothing
-          came of it. One increment, however many tiers failed.
+          allowed to touch under this pass's profile. It spends nothing.
+        * **failed** — a tier raised, or a tier was tried and nothing came of
+          it: the summariser calls all failed and the floor, if it ran, had
+          nothing left to remove. One increment, however many tiers failed.
 
-        A reactive pass (after a provider rejection) spends
+        With the floor in the cascade a pass that could remove anything always
+        makes progress, so only a history already at its floor can spend the
+        budget. A reactive pass (after a provider rejection) spends
         :attr:`CompactionState.reactive_retry_count`; every other pass spends
         :attr:`CompactionState.retry_count`. Both are bounded by
         :attr:`LoopConstants.compaction_failed_max_retries`, and breaching the
         bound raises :class:`CompactionExhaustedError` chained to the tier
         exception when there was one.
         """
-        tier1, tier2, tier3 = attempt.tier1, attempt.tier2, attempt.tier3
+        tier1, tier2, tier3, floor = attempt.tier1, attempt.tier2, attempt.tier3, attempt.floor
         progress = (
             attempt.tokens_after < attempt.tokens_before
             or (tier1 is not None and tier1.messages_modified > 0)
             or (tier2 is not None and tier2.turns_summarised > 0)
             or (tier3 is not None and tier3.spans_folded > 0)
+            or (floor is not None and floor.messages_dropped > 0)
         )
         if progress:
             compaction_state.reset_retries()
@@ -371,12 +387,12 @@ class ContextManager:
         the run into ``COMPACTING``, fire the compaction hooks, write a usage
         row and a snapshot, and tell the client it is compacting — once an
         iteration, for as long as the estimate stays over the gate. The answer
-        mirrors the tiers' own eligibility (the proactive profile: routine keep
-        window, seeded history untouched), so a ``False`` here is exactly a
-        pass that would have changed nothing and called nothing. ``force``
-        selects :meth:`force_compaction`'s rules, under which units the
-        failure census has written off are still eligible. ``llm_tiers=False``
-        asks about Tier 1 alone, as a pass run with the same flag would.
+        mirrors the tiers' own eligibility under the proactive profile (routine
+        keep window, seeded history untouched), the floor included, so a
+        ``False`` here is exactly a history at its floor. ``force`` selects
+        :meth:`force_compaction`'s rules, under which units the failure census
+        has written off are still eligible; ``llm_tiers=False`` leaves the
+        summariser tiers out, as a pass run with the same flag would.
         """
         budgets = derive_budgets(self._rc)
         if tier1_has_work(
@@ -384,7 +400,10 @@ class ContextManager:
             self._rc,
             budgets.tool_result_truncation_threshold,
             protect_tail_from_index=protect_tail_from_index,
+            mask_by_age=True,
         ):
+            return True
+        if floor_has_work(history, self._rc, protect_tail_from_index=protect_tail_from_index):
             return True
         if self._compaction_llm is None or not llm_tiers:
             return False
@@ -400,6 +419,210 @@ class ContextManager:
             history, self._rc, protect_tail_from_index=protect_tail_from_index
         )
 
+    async def _run_pass(
+        self,
+        *,
+        history: list[Message],
+        compaction_state: CompactionState,
+        tenant_id: str,
+        model_name: str,
+        observability: LLMObservabilityContext | None,
+        protect_tail_from_index: int | None,
+        record_request: RequestRecorder | None,
+        llm_tiers: bool,
+        overhead_tokens: int,
+        reactive: bool,
+        forced: bool,
+        label: str,
+    ) -> CompactionAttempt:
+        """One pass of the cascade: mask, summarise, fold, floor — each only while room is still needed.
+
+        The pass aims at the TARGET, ``compaction_trigger_tokens *
+        compaction_target_ratio``, measured on the whole prompt: the history
+        plus ``overhead_tokens`` (system prompt and tools). Each tier runs only
+        while the prompt is above the target, cheapest first. If the prompt is
+        still above the TRIGGER when the model tiers are done — the summariser
+        failed, timed out, is suspended, or found nothing worth a call — the
+        floor removes the oldest spans until the target is met or nothing
+        removable is left. So every pass that is opened ends below the trigger
+        or at the floor; a summary is an improvement on the floor, never a
+        precondition for progress.
+
+        The ledger is rebuilt from the history's own ledger state plus
+        everything this pass took out of the window, and put back at the
+        boundary between the compacted past and the kept present.
+        """
+        rc = self._rc
+        budgets = derive_budgets(rc)
+        overhead = max(0, overhead_tokens)
+        trigger = budgets.compaction_trigger_tokens
+        tokens_before = self._token_estimator.estimate_history(history, rc)
+        # A pass is opened because the prompt is too large: the gate saw it
+        # over the trigger, or the provider refused it. Aiming below the
+        # current size by the same ratio as below the trigger means an opened
+        # pass always has something to free, including when the evidence that
+        # opened it (a refusal) says more than the estimate does.
+        target = max(
+            1,
+            min(
+                int(trigger * rc.compaction_target_ratio),
+                int((tokens_before + overhead) * rc.compaction_target_ratio),
+            ),
+        )
+        attempt = CompactionAttempt(
+            tokens_before=tokens_before,
+            prompt_before=tokens_before + overhead,
+            trigger_tokens=trigger,
+            target_tokens=target,
+        )
+        keep = rc.compaction_force_keep_recent_turns if reactive else None
+        compact_seeded_history = reactive
+        ledger = ledger_from_history(history)
+        ledger_before = sum(
+            self._token_estimator.estimate_message(message, rc) for message in history if is_ledger(message)
+        )
+
+        def need() -> int:
+            # What the pass still has to free: the prompt over the target, plus
+            # what the ledger has grown by — it is put back after the tiers, and
+            # a pass that met the target before adding it would end above it.
+            growth = max(0, estimate_tokens(ledger.render(rc), rc) - ledger_before) if not ledger.is_empty() else 0
+            return self._token_estimator.estimate_history(history, rc) + overhead + growth - target
+
+        tier_error: Exception | None = None
+        try:
+            attempt.tier1 = await run_tier1_truncation(
+                history=history,
+                blob_store=self._blob_store,
+                tenant_id=tenant_id,
+                rc=rc,
+                truncation_threshold_tokens=budgets.tool_result_truncation_threshold,
+                keep_recent_turns=keep,
+                protect_tail_from_index=protect_tail_from_index,
+                mask_by_age=True,
+                free_target_tokens=max(0, need()),
+                ledger=ledger,
+            )
+            compaction_state.blob_refs_created.extend(attempt.tier1.blob_refs_created)
+        except Exception as exc:
+            _logger.warning("compaction tier 1 failed; the pass continues (err=%r)", exc)
+            tier_error = exc
+            attempt.tier1 = Tier1Result(tokens_freed=0, blob_refs_created=(), messages_modified=0)
+
+        if llm_tiers and self._compaction_llm is not None and need() > 0:
+            try:
+                attempt.tier2 = await run_tier2_summarisation(
+                    history=history,
+                    compaction_llm=self._compaction_llm,
+                    state=compaction_state,
+                    rc=rc,
+                    model_name=model_name,
+                    observability=observability,
+                    protect_tail_from_index=protect_tail_from_index,
+                    free_target_tokens=need(),
+                    record_request=record_request,
+                    prompts=self._prompts,
+                    keep_recent_turns=keep,
+                    compact_seeded_history=compact_seeded_history,
+                    # A forced pass runs when the alternative is the run
+                    # ending, so it tries every unit — including the ones the
+                    # routine gate has written off.
+                    retry_failed_units=forced,
+                    blob_store=self._blob_store,
+                    tenant_id=tenant_id,
+                    ledger=ledger,
+                    roles=self._tool_roles,
+                )
+            except Exception as exc:
+                _logger.warning("compaction tier 2 failed; the pass continues (err=%r)", exc)
+                tier_error = tier_error or exc
+                attempt.tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
+
+        if llm_tiers and need() > 0:
+            attempt.tier3 = await self._fold(
+                history,
+                compaction_state,
+                model_name,
+                observability,
+                protect_tail_from_index,
+                record_request,
+                keep_recent_turns=keep,
+                compact_seeded_history=compact_seeded_history,
+                tenant_id=tenant_id,
+                ledger=ledger,
+            )
+
+        # The floor takes over where the model tiers stopped short: above the
+        # trigger for a routine pass, above the target for a forced one — a
+        # refusal, or an estimate past the emergency line, is not satisfied by
+        # merely getting back under the gate.
+        floor_line = target if forced else trigger
+        if self._token_estimator.estimate_history(history, rc) + overhead > floor_line:
+            # The ledger grows with what the floor removes, and it is put back
+            # after the floor: room for all of it is part of the target.
+            ledger_room = max(0, ledger.budget(rc) - ledger_before)
+            try:
+                attempt.floor = await run_floor(
+                    history,
+                    rc,
+                    free_target_tokens=self._token_estimator.estimate_history(history, rc)
+                    + overhead
+                    + ledger_room
+                    - target,
+                    keep_recent_turns=keep,
+                    protect_tail_from_index=protect_tail_from_index,
+                    compact_seeded_history=compact_seeded_history,
+                    ledger=ledger,
+                    roles=self._tool_roles,
+                    blob_store=self._blob_store,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                _logger.warning("compaction floor failed; the pass continues (err=%r)", exc)
+                tier_error = tier_error or exc
+
+        attempt.ledger_tokens = place_ledger(
+            history, ledger, rc, protect_tail_from_index=protect_tail_from_index
+        )
+        attempt.tokens_after = self._token_estimator.estimate_history(history, rc)
+        attempt.prompt_after = attempt.tokens_after + overhead
+        if attempt.prompt_after <= target:
+            attempt.outcome = "below_target"
+        elif attempt.prompt_after <= trigger:
+            attempt.outcome = "below_trigger"
+        elif attempt.floor is not None and attempt.floor.reached:
+            attempt.outcome = "at_floor"
+        elif attempt.tokens_after < attempt.tokens_before:
+            attempt.outcome = "above_trigger"
+        else:
+            attempt.outcome = "unchanged"
+        _logger.warning(
+            "DIAG compaction.pass label=%s outcome=%s prompt=%d->%d trigger=%d target=%d "
+            "t1_freed=%d t1_aged=%d t2=%s/%s t2_fail=%s fold=%s floor=%s ledger=%d",
+            label,
+            attempt.outcome,
+            attempt.prompt_before,
+            attempt.prompt_after,
+            trigger,
+            target,
+            attempt.tier1.tokens_freed if attempt.tier1 else 0,
+            attempt.tier1.masked_by_age if attempt.tier1 else 0,
+            attempt.tier2.turns_summarised if attempt.tier2 else "-",
+            attempt.tier2.units_attempted if attempt.tier2 else "-",
+            attempt.tier2.failures if attempt.tier2 else {},
+            attempt.tier3.spans_folded if attempt.tier3 else "-",
+            attempt.floor.messages_dropped if attempt.floor else "-",
+            attempt.ledger_tokens,
+        )
+        self._settle_pass(
+            compaction_state=compaction_state,
+            attempt=attempt,
+            reactive=reactive,
+            error=tier_error,
+            label=label,
+        )
+        return attempt
+
     async def run_compaction(
         self,
         *,
@@ -411,111 +634,35 @@ class ContextManager:
         protect_tail_from_index: int | None = None,
         record_request: RequestRecorder | None = None,
         llm_tiers: bool = True,
+        overhead_tokens: int = 0,
     ) -> CompactionAttempt:
-        """Run Tier 1 truncation; fall through to Tier 2 if needed.
+        """A routine pass: the cascade under the routine profile (see :meth:`_run_pass`).
 
-        ``llm_tiers=False`` runs Tier 1 alone — the proactive gates do that
-        while their summariser tiers are suspended.
+        ``llm_tiers=False`` leaves the summariser tiers out — the proactive
+        gates do that while they are suspended; masking and the floor still
+        run. ``protect_tail_from_index`` (set only by the per-iteration gate)
+        exempts the current just-executed batch on top of
+        ``compaction_keep_recent_turns``.
 
         Charges :attr:`CompactionState.retry_count` once per failed pass and
         nothing for a pass that found nothing to compact (see
         :meth:`_settle_pass`); raises :class:`CompactionExhaustedError` when
         :attr:`LoopConstants.compaction_failed_max_retries` is breached.
-
-        ``protect_tail_from_index`` (set only by the per-iteration gate)
-        exempts the current just-executed tool-result batch from BOTH tiers on
-        top of ``compaction_keep_recent_turns``, so a >keep parallel batch's
-        fresh, unconsumed results cannot be compacted in the same iteration
-        they were produced.
         """
-        budgets = derive_budgets(self._rc)
-        tokens_before = self._token_estimator.estimate_history(history, self._rc)
-
-        attempt = CompactionAttempt(tokens_before=tokens_before)
-
-        try:
-            tier1 = await run_tier1_truncation(
-                history=history,
-                blob_store=self._blob_store,
-                tenant_id=tenant_id,
-                rc=self._rc,
-                truncation_threshold_tokens=budgets.tool_result_truncation_threshold,
-                protect_tail_from_index=protect_tail_from_index,
-            )
-        except Exception as exc:
-            # a failed Tier-1 pass freed nothing, but tokens_after
-            # defaults to 0. Stamp the real current estimate before returning so
-            # the caller's COMPACTION_COMPLETED event does not report a phantom
-            # "full clear" (tokens_after=0 ≪ tokens_before).
-            attempt.tokens_after = self._token_estimator.estimate_history(history, self._rc)
-            self._settle_pass(
-                compaction_state=compaction_state,
-                attempt=attempt,
-                reactive=False,
-                error=exc,
-                label="tier1 truncation",
-            )
-            return attempt
-
-        attempt.tier1 = tier1
-        compaction_state.blob_refs_created.extend(tier1.blob_refs_created)
-
-        # Only fire Tier 2 if Tier 1 didn't clear enough. The bar is
-        # ``compaction_trigger_tokens * routine_min_clear_ratio`` per the
-        # cascade definition.
-        min_clear_target = int(
-            budgets.compaction_trigger_tokens
-            * self._rc.compaction_routine_min_clear_ratio
-        )
-        tier_error: Exception | None = None
-        if (
-            llm_tiers
-            and tier1.tokens_freed < min_clear_target
-            and self._compaction_llm is not None
-        ):
-            try:
-                tier2 = await run_tier2_summarisation(
-                    history=history,
-                    compaction_llm=self._compaction_llm,
-                    state=compaction_state,
-                    rc=self._rc,
-                    model_name=model_name,
-                    observability=observability,
-                    protect_tail_from_index=protect_tail_from_index,
-                    record_request=record_request,
-                    prompts=self._prompts,
-                    # Tier-2 only needs to make up the shortfall Tier-1 left
-                    # against the min-clear target; bound its per-pass LLM-call
-                    # count to that budget rather than summarising every eligible
-                    # turn serially.
-                    free_target_tokens=min_clear_target - tier1.tokens_freed,
-                )
-            except Exception as exc:
-                tier_error = exc
-                tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
-            attempt.tier2 = tier2
-
-        if llm_tiers:
-            attempt.tier3 = await self._fold(
-                history,
-                compaction_state,
-                model_name,
-                observability,
-                protect_tail_from_index,
-                record_request,
-            )
-
-        tokens_after = self._token_estimator.estimate_history(history, self._rc)
-        attempt.tokens_after = tokens_after
-
-        self._settle_pass(
+        return await self._run_pass(
+            history=history,
             compaction_state=compaction_state,
-            attempt=attempt,
+            tenant_id=tenant_id,
+            model_name=model_name,
+            observability=observability,
+            protect_tail_from_index=protect_tail_from_index,
+            record_request=record_request,
+            llm_tiers=llm_tiers,
+            overhead_tokens=overhead_tokens,
             reactive=False,
-            error=tier_error,
+            forced=False,
             label="compaction",
         )
-        return attempt
 
     async def force_compaction(
         self,
@@ -529,134 +676,38 @@ class ContextManager:
         record_request: RequestRecorder | None = None,
         reactive: bool = False,
         llm_tiers: bool = True,
+        overhead_tokens: int = 0,
     ) -> CompactionAttempt:
-        """Run BOTH Tier 1 + Tier 2 unconditionally for emergency recovery.
+        """An emergency pass: the same cascade, with units the census wrote off retried.
 
- Unlike :meth:`run_compaction` (which gates Tier 2 behind a
- "Tier 1 didn't free enough" check), this method always runs both
- tiers — the upstream provider has already signalled that the
- request exceeds the window, so we must free as much as possible
- before re-streaming.
+        ``reactive`` distinguishes a provider rejection from the two proactive
+        emergency gates (turn start, per iteration) that also land here on an
+        estimate. Only a rejection switches to the emergency profile: the keep
+        window shrinks to ``compaction_force_keep_recent_turns`` and turns
+        seeded from earlier runs become eligible for replacement, every
+        replacement keeping the seed tag. The reactive-413 caller passes no
+        ``protect_tail_from_index``: the provider already rejected the request,
+        so the most recent batch was never read.
 
- Raises :class:`CompactionExhaustedError` per :meth:`_settle_pass`. A
- proactive pass shares :meth:`run_compaction`'s budget; a reactive pass has
- its own, so proactive failures cannot use up the one profile that may still
- compact seeded history. A pass that found nothing it was allowed to touch
- spends neither.
-
- ``protect_tail_from_index`` (set only by the per-iteration
- emergency-cliff gate) exempts the current just-executed tool-result
- batch from BOTH tiers on top of the keep window. The reactive-413
- caller passes ``None`` (the provider already rejected the request, so
- the whole history is fair game and the most-recent batch was never
- wire-accepted).
-
- ``reactive`` distinguishes a provider rejection from the two proactive
- emergency gates (turn start, per iteration) that also land here on an
- estimate. Only a rejection switches to the emergency profile: the keep
- window shrinks to ``compaction_force_keep_recent_turns`` and turns
- seeded from earlier runs become eligible for lossy Tier 2/Tier 3
- replacement, every replacement keeping the seed tag. The proactive
- gates keep the routine window and leave seeds untouched.
- """
-        budgets = derive_budgets(self._rc)
-        tokens_before = self._token_estimator.estimate_history(history, self._rc)
-
-        attempt = CompactionAttempt(tokens_before=tokens_before)
-
-        # A provider rejection is stronger evidence than the routine estimate:
-        # keep only the emergency tail and make old session seeds eligible for
-        # lossy compaction. Seed provenance is carried onto every replacement
-        # so the host still excludes prior-run content when it persists the
-        # new run. A proactive emergency pass has no such proof and keeps the
-        # routine profile.
-        force_keep_recent_turns = (
-            self._rc.compaction_force_keep_recent_turns if reactive else None
-        )
-        compact_seeded_history = reactive
-
-        tier_error: Exception | None = None
-        # Tier 1 always runs.
-        try:
-            tier1 = await run_tier1_truncation(
-                history=history,
-                blob_store=self._blob_store,
-                tenant_id=tenant_id,
-                rc=self._rc,
-                truncation_threshold_tokens=budgets.tool_result_truncation_threshold,
-                keep_recent_turns=force_keep_recent_turns,
-                protect_tail_from_index=protect_tail_from_index,
-            )
-        except Exception as exc:
-            tier_error = exc
-            tier1 = Tier1Result(
-                tokens_freed=0,
-                blob_refs_created=(),
-                messages_modified=0,
-            )
-
-        attempt.tier1 = tier1
-        compaction_state.blob_refs_created.extend(tier1.blob_refs_created)
-
-        # Tier 2 always runs in force mode, unless the caller has suspended
-        # the summariser tiers (``llm_tiers=False``, proactive only).
-        if self._compaction_llm is not None and llm_tiers:
-            # Free aggressively but bounded — enough to bring the post-Tier-1
-            # history back under the trigger threshold so the request can
-            # re-stream, without summarising every eligible turn serially.
-            tokens_after_tier1 = self._token_estimator.estimate_history(history, self._rc)
-            free_target = tokens_after_tier1 - budgets.compaction_trigger_tokens
-            try:
-                tier2 = await run_tier2_summarisation(
-                    history=history,
-                    compaction_llm=self._compaction_llm,
-                    state=compaction_state,
-                    rc=self._rc,
-                    model_name=model_name,
-                    observability=observability,
-                    protect_tail_from_index=protect_tail_from_index,
-                    free_target_tokens=free_target if free_target > 0 else None,
-                    record_request=record_request,
-                    prompts=self._prompts,
-                    keep_recent_turns=force_keep_recent_turns,
-                    compact_seeded_history=compact_seeded_history,
-                    # A forced pass runs when the alternative is the run
-                    # ending, so it tries every unit — including the ones the
-                    # routine gate has written off. A call that is probably
-                    # wasted is cheaper than a run that cannot continue.
-                    retry_failed_units=True,
-                )
-            except Exception as exc:
-                if tier_error is None:
-                    tier_error = exc
-                tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
-            attempt.tier2 = tier2
-
-        if llm_tiers:
-            attempt.tier3 = await self._fold(
-                history,
-                compaction_state,
-                model_name,
-                observability,
-                protect_tail_from_index,
-                record_request,
-                keep_recent_turns=force_keep_recent_turns,
-                compact_seeded_history=compact_seeded_history,
-            )
-
-        tokens_after = self._token_estimator.estimate_history(history, self._rc)
-        attempt.tokens_after = tokens_after
-
-        # ANY progress (tokens freed, or any Tier 1 / Tier 2 / Tier 3 rewrite)
-        # clears the budget; a pass that tried and failed is charged once.
-        self._settle_pass(
+        A proactive pass shares :meth:`run_compaction`'s retry budget; a
+        reactive pass has its own, so proactive failures cannot use up the one
+        profile that may still compact seeded history.
+        """
+        return await self._run_pass(
+            history=history,
             compaction_state=compaction_state,
-            attempt=attempt,
+            tenant_id=tenant_id,
+            model_name=model_name,
+            observability=observability,
+            protect_tail_from_index=protect_tail_from_index,
+            record_request=record_request,
+            llm_tiers=llm_tiers,
+            overhead_tokens=overhead_tokens,
             reactive=reactive,
-            error=tier_error,
+            forced=True,
             label="reactive force_compaction" if reactive else "force_compaction",
         )
-        return attempt
+
 
     def current_prompt_tokens(
         self,

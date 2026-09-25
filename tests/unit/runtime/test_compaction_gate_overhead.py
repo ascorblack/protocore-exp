@@ -132,7 +132,10 @@ def test_the_gate_adds_what_the_history_does_not_carry() -> None:
 
 @pytest.mark.asyncio
 async def test_after_a_request_the_engine_gate_counts_the_system_prompt_and_tools() -> None:
-    rc = _rc()
+    # The gate between iterations would now compact this history — the floor
+    # removes what the summariser cannot — and the claim here is about the
+    # measurement the gate reads, so the gate itself is kept out of the run.
+    rc = _rc().model_copy(update={"compaction_per_iteration_enabled": False})
     trigger = derive_budgets(rc).compaction_trigger_tokens
     tools = [_WideTool(f"Tool{n}") for n in range(20)]
     llm = _OneCallThenAnswer()

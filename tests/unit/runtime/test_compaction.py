@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 
 import pytest
 
@@ -20,6 +21,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.runtime.context.carrier import read_carrier
 from protocore.runtime.context.compaction import (
     COMPACTION_FOLD_METADATA_KEY,
     CompactionState,
@@ -27,8 +29,6 @@ from protocore.runtime.context.compaction import (
     Tier2Result,
     _message_text_for_estimation,
     _strip_injection_patterns,
-    _summary_from_response,
-    build_summary_schema,
     estimate_message_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
@@ -205,7 +205,7 @@ async def test_tier2_summarisation_replaces_old_turn() -> None:
         # turn (a sub-floor turn is correctly skipped — see
         # test_tier2_skips_tiny_turns_no_inflation_no_llm_calls).
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="hello there " * 20)]),
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="hi back " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="hi back " * 100)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     state = CompactionState()
@@ -249,7 +249,7 @@ async def test_tier2_summarisation_propagates_observability_context() -> None:
         # summariser call is issued) — the assertion below is on the propagated
         # observability context of that call. Assistant-role because an
         # operator turn is never summarised.
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 100)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     await run_tier2_summarisation(
@@ -738,16 +738,12 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tier2_extracts_summary_from_json_envelope() -> None:
-    """``complete_structured`` is called with :func:`build_summary_schema`
-    (json_object), and the openai-compat provider returns the model's RAW
-    content without parsing. ``response.message.text`` is therefore the full
-    JSON envelope.
+async def test_tier2_keeps_the_summary_a_json_envelope_carries() -> None:
+    """A model that answers in JSON anyway still wrote a summary.
 
-    The schema declares ``summary`` and nothing else, but a provider that does
-    not enforce the grammar can still return extra keys. The replacement
-    ``<compacted-turn>`` body must carry the extracted ``summary`` ONLY — never
-    the envelope, and never a key the schema never asked for.
+    The summariser is asked for plain text, but a provider in JSON mode, or a
+    model in the habit, can wrap its answer as ``{"summary": ...}``. The text
+    inside is kept; keys nobody asked for are not.
     """
     rc = LoopConstants(
         model_context_window=4_096,
@@ -755,58 +751,71 @@ async def test_tier2_extracts_summary_from_json_envelope() -> None:
         compaction_protect_first_user_turn=False,
     )
     llm = InMemoryLLMProvider()
-    # What a prod provider returns for a structured call: the full JSON
-    # envelope, not a plain-text summary sentence.
     summary_sentence = "User asked X; assistant used tool Y to answer."
     envelope = json.dumps(
         {
             "summary": summary_sentence,
             "unrequested_tool_names": ["read_file", "write_file"],
-            "unrequested_paths": ["/a", "/b", "/c"],
         }
     )
     llm.queue_response(text=envelope)
 
     history = [
-        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 60)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
-    state = CompactionState()
     result = await run_tier2_summarisation(
         history=history,
         compaction_llm=llm,
-        state=state,
+        state=CompactionState(),
         rc=rc,
         model_name="mock",
     )
 
     assert result.turns_summarised == 1
-    # The replacement turn must carry the EXTRACTED summary — not the JSON
-    # envelope, not the preserved_* arrays.
+    assert result.recovered == {"json": 1}
     replaced = history[0]
-    assert replaced.text.endswith(f">{summary_sentence}</compacted-turn>")
-    assert '"unrequested_tool_names"' not in replaced.text
-    assert '"unrequested_paths"' not in replaced.text
     assert summary_sentence in replaced.text
-
-
-def test_summary_schema_declares_only_the_field_that_is_read() -> None:
-    """A declared field is paid for in the output budget whether or not it is
-    read, so the schema must not carry one that nothing extracts. Tier 2 reads
-    ``summary`` and only ``summary``."""
-    schema = build_summary_schema(LoopConstants())
-
-    assert set(schema["properties"]) == {"summary"}
-    assert schema["required"] == ["summary"]
-    assert schema["additionalProperties"] is False
+    assert "unrequested_tool_names" not in replaced.text
+    assert replaced.text.rstrip().endswith("</compacted-turn>")
 
 
 @pytest.mark.asyncio
-async def test_tier2_skips_malformed_json_envelope() -> None:
-    """a response that LOOKS like the schema envelope but is
-    unparseable must not be wrapped verbatim (the prior bug behaviour) and
-    must not crash; the unit is skipped with a warning so the next pass can
-    retry it.
+async def test_the_summariser_is_asked_for_plain_text_under_a_system_instruction() -> None:
+    """No schema, and the instruction is not something the user could have said.
+
+    The request is a plain-text completion; the instruction is the system
+    message and the material to summarise is fenced as data in the user
+    message, so a summary cannot carry the instruction forward as the user's.
+    """
+    rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=1)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="## Progress\nread the file")
+    history = [_assistant("word " * 600), _operator("recent")]
+
+    await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    request = llm.calls[0]
+    assert request.extra.get("response_format") is None
+    assert [m.role for m in request.messages] == [MessageRole.system, MessageRole.user]
+    assert "## Facts and values" in request.messages[0].text
+    assert request.messages[1].text.startswith("<transcript>\n")
+    assert "word word" in request.messages[1].text
+
+
+@pytest.mark.asyncio
+async def test_an_unterminated_json_summary_is_kept() -> None:
+    """The live failure shape: ``finish=stop`` and no closing brace.
+
+    deepseek-flash in JSON mode returned ``{"summary": "Turn 1: …(UNKNOWN)."``
+    and nothing after it. The host threw it away as "not JSON" and the unit
+    stayed; the text inside is a perfectly good summary.
     """
     rc = LoopConstants(
         model_context_window=4_096,
@@ -814,55 +823,51 @@ async def test_tier2_skips_malformed_json_envelope() -> None:
         compaction_protect_first_user_turn=False,
     )
     llm = InMemoryLLMProvider()
-    llm.queue_response(text="{not valid json")
+    llm.queue_response(text='{"summary": "Turn 1: ran check.py --case 7; exit 0 (UNKNOWN)."')
 
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 60)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
-    state = CompactionState()
     result = await run_tier2_summarisation(
         history=history,
         compaction_llm=llm,
-        state=state,
+        state=CompactionState(),
         rc=rc,
         model_name="mock",
     )
 
-    assert result.turns_summarised == 0
-    # The original turn is left intact — no <compacted-turn> wrapper written.
-    assert history[0].text == "old turn " * 20
+    assert result.turns_summarised == 1
+    assert result.recovered == {"unterminated_json": 1}
+    assert "ran check.py --case 7; exit 0 (UNKNOWN)." in history[0].text
 
 
 @pytest.mark.asyncio
-async def test_tier2_skips_json_envelope_without_summary_field() -> None:
-    """a parseable JSON envelope that does NOT carry a ``summary``
-    string field is a schema contract violation; skip the unit (don't wrap
-    the whole envelope verbatim as a summary).
-    """
+async def test_text_that_is_not_json_is_kept_as_a_summary() -> None:
+    """"structured response is not JSON" was a lost summary; plain text is the request now."""
     rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
     )
     llm = InMemoryLLMProvider()
-    llm.queue_response(text=json.dumps({"foo": "bar", "preserved_tool_names": []}))
+    llm.queue_response(text="Ran the checks; all passed except case 12 (timeout).")
 
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 60)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
-    state = CompactionState()
     result = await run_tier2_summarisation(
         history=history,
         compaction_llm=llm,
-        state=state,
+        state=CompactionState(),
         rc=rc,
         model_name="mock",
     )
 
-    assert result.turns_summarised == 0
-    assert history[0].text == "old turn " * 20
+    assert result.turns_summarised == 1
+    assert result.recovered == {"unheaded": 1}
+    assert "all passed except case 12 (timeout)." in history[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -1183,34 +1188,32 @@ async def test_tier2_leaves_a_unit_below_the_operator_minimum_uncalled() -> None
 
 
 @pytest.mark.asyncio
-async def test_the_summariser_is_asked_for_a_word_budget_that_follows_the_unit() -> None:
-    """A fixed sentence count asks for the same output whatever it is handed."""
-    rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=1)
+async def test_an_empty_reply_is_a_failed_summary_counted_against_the_unit() -> None:
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=1,
+        compaction_protect_first_user_turn=False,
+    )
     llm = InMemoryLLMProvider()
-    llm.queue_response(text="summary")
-    unit = _assistant("word " * 600)
-    history = [unit, _operator("recent")]
-    before = estimate_message_tokens(unit, rc)
-
-    await run_tier2_summarisation(
+    llm.queue_response(text="")
+    original = "old turn " * 60
+    history = [
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text=original)]),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
+    ]
+    state = CompactionState()
+    result = await run_tier2_summarisation(
         history=history,
         compaction_llm=llm,
-        state=CompactionState(),
+        state=state,
         rc=rc,
         model_name="mock",
     )
 
-    scaled = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
-    # The budget follows the unit until one of the caps on what the reply may
-    # hold takes over: the output cap less its envelope, and the grammar's own
-    # maxLength on the summary string.
-    expected = min(
-        scaled,
-        (rc.compaction_summary_max_output_tokens - rc.compaction_summary_envelope_tokens)
-        // rc.compaction_summary_output_tokens_per_word,
-        rc.compaction_summary_string_max_chars // rc.compaction_summary_chars_per_word,
-    )
-    assert f"at most {expected} words" in llm.calls[0].messages[0].text
+    assert result.turns_summarised == 0
+    assert result.failures == {"empty": 1}
+    assert history[0].text == original
+    assert list(state.failed_anchor_keys.values()) == [1]
 
 
 @pytest.mark.asyncio
@@ -1221,18 +1224,20 @@ async def test_summariser_calls_go_out_in_batches_of_the_configured_width() -> N
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
         compaction_summariser_parallelism=3,
+        # One call per unit, so the batch width is what is measured.
+        compaction_summary_group_max_tokens=0,
     )
     in_flight = 0
     peak = 0
 
     class _CountingProvider(InMemoryLLMProvider):
-        async def complete_structured(self, request, response_schema):  # type: ignore[no-untyped-def]
+        async def complete_text(self, request):  # type: ignore[no-untyped-def]
             nonlocal in_flight, peak
             in_flight += 1
             peak = max(peak, in_flight)
             try:
                 await asyncio.sleep(0)
-                return await super().complete_structured(request, response_schema)
+                return await super().complete_text(request)
             finally:
                 in_flight -= 1
 
@@ -1254,12 +1259,22 @@ async def test_summariser_calls_go_out_in_batches_of_the_configured_width() -> N
     assert peak == 3
 
 
-def test_an_unusable_summariser_reply_yields_no_summary() -> None:
-    assert _summary_from_response("", "unit") == ""
-    assert _summary_from_response("plain prose", "unit") == "plain prose"
-    assert _summary_from_response("{not json", "unit") == ""
-    assert _summary_from_response('{"summary": 7}', "unit") == ""
-    assert _summary_from_response('{"summary": "kept"}', "unit") == "kept"
+def test_a_reply_is_read_whatever_shape_it_came_back_in() -> None:
+    """Every shape a summariser reply has been seen to take yields text, or nothing."""
+    rc = LoopConstants()
+
+    def read(raw: str, **kwargs: object) -> str:
+        return read_carrier(raw, budget_tokens=400, rc=rc, **kwargs).text  # type: ignore[arg-type]
+
+    assert read("") == ""
+    assert read("<think>only reasoning, never closed") == ""
+    assert read("plain prose") == "## Notes\nplain prose"
+    assert read('{"summary": "kept"}') == "## Notes\nkept"
+    assert "cut here" in read('{"summary": "cut here')
+    assert read("```\n## Open\nnext: rerun\n```") == "## Open\nnext: rerun"
+    assert read("<think>plan</think>\n**Failures**: exit 2 on case 9") == "## Failures\nexit 2 on case 9"
+    # A reply the output cap cut loses its unfinished last line, not the rest.
+    assert read("## Progress\nstep one done\nstep two was hal", truncated=True) == "## Progress\nstep one done"
 
 
 # ---------------------------------------------------------------------------
@@ -1323,10 +1338,11 @@ async def test_tier3_folds_a_run_and_keeps_the_task_and_the_recent_instructions(
     assert fold.metadata[COMPACTION_FOLD_METADATA_KEY] == {"messages": 9, "operator_turns": 1}
     assert fold.text.startswith("<compacted-turn id='fold-")
     assert history[2].text == "recent instruction, must stay"
-    # The operator's own words went to the summariser, labelled as theirs.
-    sent = llm.calls[0].messages[0].text
-    assert "[operator said] Also remove the model-name field" in sent
-    assert "[earlier summary] summary 0" in sent
+    # The operator's own words went to the summariser as material, labelled
+    # as theirs; the instruction went separately, as the system message.
+    sent = llm.calls[0].messages[1].text
+    assert "[operator said]\nAlso remove the model-name field" in sent
+    assert "[earlier summary]\nsummary 0" in sent
 
 
 @pytest.mark.asyncio
@@ -1500,7 +1516,7 @@ async def test_a_fold_no_smaller_than_the_run_it_replaces_is_discarded() -> None
 @pytest.mark.asyncio
 async def test_a_summariser_failure_leaves_the_run_intact() -> None:
     class _Failing(InMemoryLLMProvider):
-        async def complete_structured(self, request, response_schema):  # type: ignore[no-untyped-def]
+        async def complete_text(self, request):  # type: ignore[no-untyped-def]
             raise RuntimeError("provider down")
 
     history = _folding_history()
@@ -1519,10 +1535,10 @@ async def test_a_summariser_failure_leaves_the_run_intact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_fold_prompt_states_the_word_target_and_the_quoting_rule() -> None:
-    rc = _fold_rc(compaction_fold_summary_target_words=321)
+async def test_the_fold_instruction_states_the_budget_and_the_carrier_headings() -> None:
+    rc = _fold_rc()
     llm = InMemoryLLMProvider()
-    llm.queue_response(text=json.dumps({"summary": "folded"}))
+    llm.queue_response(text="## Progress\nfolded")
 
     await run_tier3_fold(
         history=_folding_history(),
@@ -1532,7 +1548,9 @@ async def test_the_fold_prompt_states_the_word_target_and_the_quoting_rule() -> 
         model_name="mock",
     )
 
-    prompt = llm.calls[0].messages[0].text
-    assert "about 321 words" in prompt
-    assert "exact quote in a list headed 'Operator said:'" in prompt
-    assert "state unknown outcomes as unknown" in prompt
+    instruction = llm.calls[0].messages[0].text
+    assert llm.calls[0].messages[0].role is MessageRole.system
+    assert re.search(r"Stay within about \d+ words", instruction)
+    assert "## Facts and values" in instruction
+    assert "say so under Open rather than guessing" in instruction
+    assert "kept word for word elsewhere" in instruction
