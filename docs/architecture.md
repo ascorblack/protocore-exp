@@ -508,7 +508,10 @@ crashes. The shared assistant loop is **not** a single immutable path:
   `provider_reserves_output_in_context_window`, true by default — an endpoint
   that sizes its input window independently of the requested output sets it
   false and gets that share of the window back. Consumers read the effective
-  value; the emergency cliff is held strictly above it.
+  value; the emergency cliff is held strictly above it. Both are whole-prompt
+  sizes, so the gate adds to the history's estimate what the last request
+  carried besides it — its system messages and tool definitions, in the same
+  calibrated tokens; before a run's first request that part is zero.
 - `runtime/request_budget.py` — fits every assembled request to the hard
   window by clipping its output cap. The size it fits to is the calibrated
   estimate, except near the edge: once the estimate reaches

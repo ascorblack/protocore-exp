@@ -744,6 +744,11 @@ class QueryEngine:
             "_exact_token_counts",
             "_token_estimate_calibration_baseline",
             "_token_estimate_calibration_model",
+            # The size of the system prompt and tool surface the last request
+            # carried. The next turn's first gate runs before its first request
+            # and is sized as a whole prompt; cleared here it would read the
+            # history alone for that one gate.
+            "_request_overhead_tokens_raw",
             "last_heartbeat_ms",
             "_pinned_tool_result_ids",
             "_trimmed_tool_result_ids",
@@ -970,6 +975,14 @@ class QueryEngine:
         # the provider. A rejection for length reads it to learn how far the
         # estimate ran short; ``None`` while nothing has been sent this message.
         self._last_dispatched_prompt: tuple[str, int] | None = None
+        # The heuristic's raw size of what the last dispatched request carried
+        # besides the history: its system messages and its tool definitions.
+        # The compaction gate adds it to the history, because the trigger is a
+        # whole-prompt size. Deliberately not cleared per message: it describes
+        # the deployment's fixed prompt, which the next request refreshes, and 0
+        # (before the first request of a run) leaves the gate on the history
+        # alone, which is how it read before.
+        self._request_overhead_tokens_raw: int = 0
         # Exact counts a provider has already made of this run's requests, the
         # last full request it counted, and any back-off after a failed count.
         self._exact_token_counts = ExactTokenCountCache()
@@ -2648,6 +2661,7 @@ class QueryEngine:
             "pending_interrupts": serialise_interrupts(self._pending_interrupts),
             "usage": self.total_usage.to_dict(),
             "last_observed_prompt_tokens": self.last_observed_prompt_tokens,
+            "request_overhead_tokens_raw": self._request_overhead_tokens_raw,
             "token_estimate_calibration": self.config.rc.token_estimate_calibration,
             "token_estimate_calibration_model": (
                 self._token_estimate_calibration_model
@@ -3196,6 +3210,11 @@ class QueryEngine:
         )
         self.total_usage = restored_total_usage
         self.last_observed_prompt_tokens = restored_observed_prompt_tokens
+        # A snapshot written before the field existed resumes with 0, which is
+        # the history-only gate the run would have had until its next request.
+        self._request_overhead_tokens_raw = max(
+            0, int(snapshot.get("request_overhead_tokens_raw", 0) or 0)
+        )
         self.compaction_state = restored_compaction
         self.last_heartbeat_ms = int(snapshot.get("last_heartbeat_ms", 0))
         snapshot_root_run_id = snapshot.get("root_run_id", self.config.root_run_id)
@@ -3757,12 +3776,20 @@ class QueryEngine:
     def is_terminal(self) -> bool:
         return is_terminal(self.state)
 
+    def request_overhead_tokens(self) -> int:
+        """The calibrated size of what the last request carried besides the history."""
+        return int(self._request_overhead_tokens_raw * self.config.rc.token_estimate_calibration)
+
     def needs_compaction(self) -> bool:
-        return self.context_manager.needs_compaction(self.history)
+        return self.context_manager.needs_compaction(
+            self.history, overhead_tokens=self.request_overhead_tokens()
+        )
 
     def needs_emergency_compaction(self) -> bool:
-        """Return True when history exceeds the emergency cliff (proactive force)."""
-        return self.context_manager.needs_emergency_compaction(self.history)
+        """Return True when the prompt exceeds the emergency cliff (proactive force)."""
+        return self.context_manager.needs_emergency_compaction(
+            self.history, overhead_tokens=self.request_overhead_tokens()
+        )
 
     @property
     def last_request_manifest(self) -> dict[str, Any] | None:

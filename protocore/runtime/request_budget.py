@@ -21,7 +21,7 @@ from typing import Any, cast
 
 from protocore.contracts.llm import LLMContextWindowExceeded, LLMRequest
 from protocore.contracts.runtime_constants import LoopConstants
-from protocore.contracts.types import Message
+from protocore.contracts.types import Message, MessageRole
 from protocore.logging_utils import get_logger
 from protocore.runtime.context.compaction import estimate_history_tokens_uncalibrated
 from protocore.runtime.tool_surface import read_tool_surface, tool_surface_tokens
@@ -57,6 +57,17 @@ def estimate_request_prompt_tokens_uncalibrated(
     raw_tokens = estimate_history_tokens_uncalibrated(list(request.messages), rc)
     raw_tokens += tool_surface_tokens(surface, rc)
     return raw_tokens
+
+
+def estimate_request_overhead_tokens_uncalibrated(
+    request: LLMRequest,
+    rc: LoopConstants,
+) -> int:
+    """The part of a request the history does not carry: system messages and tool definitions."""
+    system = [message for message in request.messages if message.role is MessageRole.system]
+    return estimate_history_tokens_uncalibrated(system, rc) + tool_surface_tokens(
+        read_tool_surface(request.tools), rc
+    )
 
 
 def fit_max_tokens(

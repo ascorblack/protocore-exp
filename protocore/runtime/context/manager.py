@@ -668,15 +668,28 @@ class ContextManager:
     def needs_compaction(
         self,
         history: Sequence[Message],
+        *,
+        overhead_tokens: int = 0,
     ) -> bool:
-        """Return ``True`` if the current prompt exceeds the trigger threshold."""
+        """Return ``True`` if the current prompt exceeds the trigger threshold.
+
+        ``overhead_tokens`` is the part of the prompt the history does not
+        carry — the system prompt and the tool definitions — in the same
+        calibrated tokens. The trigger is sized as a whole prompt (the largest
+        one the provider accepts, less a turn's headroom), so the history alone
+        must not be held against it: with a large tool surface it would reach
+        the trigger only after the whole request had passed the provider's
+        ceiling, and compaction would first run on a refusal.
+        """
         budgets = derive_budgets(self._rc)
-        current = self.current_prompt_tokens(history)
+        current = self.current_prompt_tokens(history) + max(0, overhead_tokens)
         return current > budgets.compaction_trigger_tokens
 
     def needs_emergency_compaction(
         self,
         history: Sequence[Message],
+        *,
+        overhead_tokens: int = 0,
     ) -> bool:
         """Return ``True`` if the current prompt exceeds the emergency cliff.
 
@@ -688,7 +701,7 @@ class ContextManager:
         enforces ``compaction_trigger_ratio < compaction_emergency_ratio``).
         """
         budgets = derive_budgets(self._rc)
-        current = self.current_prompt_tokens(history)
+        current = self.current_prompt_tokens(history) + max(0, overhead_tokens)
         return current > budgets.compaction_emergency_tokens
 
 

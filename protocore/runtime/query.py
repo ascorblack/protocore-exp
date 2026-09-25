@@ -202,6 +202,7 @@ from protocore.runtime.loop_strategies import select_strategy
 from protocore.runtime.prompt_caching import apply_system_and_3
 from protocore.runtime.request_budget import (
     count_request_tokens_exactly,
+    estimate_request_overhead_tokens_uncalibrated,
     estimate_request_prompt_tokens_uncalibrated,
     fit_request_to_context_measured,
     near_limit,
@@ -4927,6 +4928,9 @@ async def _drive_one_stream(
     # derived from this wire cap rather than from the larger pre-fit budget.
     engine._last_fitted_request_max_tokens = request.max_tokens
     engine._last_dispatched_prompt = (request.model, fitted.raw_estimate)
+    engine._request_overhead_tokens_raw = estimate_request_overhead_tokens_uncalibrated(
+        request, rc
+    )
     upstream = engine.llm.stream_with_tools(request)
 
     # Decide ONCE, up-front, whether this turn's visible assistant TEXT is the
@@ -5487,7 +5491,11 @@ async def _calibrate_near_compaction_trigger(engine: QueryEngine) -> None:
         # fit on its own count and sent to compaction.
         return
     estimate = engine.context_manager.current_prompt_tokens(engine.history)
-    if not near_limit(estimate, derive_budgets(rc).compaction_trigger_tokens, rc):
+    if not near_limit(
+        estimate + engine.request_overhead_tokens(),
+        derive_budgets(rc).compaction_trigger_tokens,
+        rc,
+    ):
         return
     request = LLMRequest(model=engine.effective_model_name, messages=list(engine.history))
     measured = await count_request_tokens_exactly(

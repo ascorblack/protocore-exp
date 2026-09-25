@@ -8,6 +8,14 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The compaction gate sizes the whole prompt.** The trigger and the
+  emergency cliff are whole-prompt sizes, but the gate held the history's
+  estimate against them. With a large system prompt and tool surface — 56k of
+  a 256k window in the case that showed it — the history reached the trigger
+  only after the request had passed the provider's ceiling, so the fit clipped
+  the output cap turn after turn and compaction first ran on a refusal. The
+  gate now adds what the last request carried besides the history (its system
+  messages and tool definitions, calibrated); the figure rides the snapshot.
 - **A history made only of short rounds can be compacted.** Tier 2 skipped
   every unit below `compaction_summary_min_unit_tokens`, and the fold takes only
   summaries and operator turns, so a run that works in many rounds of one short
