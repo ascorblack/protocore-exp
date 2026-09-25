@@ -72,6 +72,7 @@ the Russian [`../README.md`](../README.md) is primary, and the English
 | [`architecture.md`](architecture.md) | Deep reference: structure, turn data flow, per-subsystem tour. |
 | [`contracts.md`](contracts.md) | Interface `Protocol`s and the core type system. |
 | [`runtime-constants.md`](runtime-constants.md) | The `RuntimeConstants` model and how to read defaults. |
+| [`compaction.md`](compaction.md) | The compaction contract: invariants, tiers, budgets, carrier, failure states. |
 | [`tools.md`](tools.md) | Lean verb surface, `@tool`, dispatch, and the permission gate. |
 | [`extending.md`](extending.md) | The four extension seams and the rules you must not break. |
 | [`testing.md`](testing.md) | Running tests, lint, types, security, and the boundary guard. |

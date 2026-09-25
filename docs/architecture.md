@@ -547,127 +547,27 @@ crashes. The shared assistant loop is **not** a single immutable path:
   snapshot and survives a resume on the same model; a new run starts from the
   configured `token_estimate_calibration`, so a host that knows its content
   runs dense seeds that value per scope.
-- `runtime/context/compaction.py` — three passes over the transcript, in
-  order, each one taking what the pass before it could not.
-  **Tier 1** replaces an over-budget tool result with a placeholder and puts
-  the bytes in the blob store; the content is recoverable and the preview says
-  what was shed. It may also shed aged reasoning or an over-budget frozen
-  reference while preserving message metadata, including seed provenance.
-  Routine **Tier 2** and **Tier 3** leave seeded prior-run turns untouched.
-  **Tier 2** summarises old turns through the compaction LLM —
-  one atomic unit at a time, an assistant `tool_use` turn and the results
-  answering it standing or falling together so no pair is orphaned. It never
-  summarises a turn the operator wrote: an instruction is short, so
-  paraphrasing it frees almost nothing, and it is specific, so the paraphrase
-  is a rewrite — "remove the model-name field from the header" becomes "the
-  user asked for changes" and the run acts on that instead. **Tier 3** folds
-  what Tier 2 leaves: over a long session, one summary per tool batch plus
-  every operator message become the whole window, and neither pass below can
-  take a byte off them. Each contiguous run of such messages that is at least
-  `compaction_fold_min_messages` long and `compaction_fold_min_tokens` big
-  becomes one consolidated summary in which the operator's instructions
-  survive as exact quotes; the task turn and the
-  `compaction_fold_keep_operator_turns` most recent instructions stay
-  verbatim. Reactive provider-overflow recovery may summarise and fold seed-only spans,
-  keeping only the `compaction_force_keep_recent_turns` trailing messages (one by
-  default); every replacement retains the seed tag and
-  spans split at seed/current boundaries, so the host's persistence filter
-  keeps the runs separate. Frozen compaction references remain protected. A
-  fold is a summary like any other, so a later fold absorbs it once its
-  neighbourhood has grown again.
-
-  Both summarisers assemble their request through `build_llm_request`, record
-  it to the request manifest, and are told the same two rules the wording of a
-  summary lives or dies by: keep every identifier — paths, ids, ports, URLs,
-  numbers, error codes — verbatim rather than substituting a plausible value,
-  and state an outcome with no tool result or confirmation behind it as
-  UNKNOWN rather than as done or not done. The per-turn prompt states its
-  budget in characters as well as words, says a longer reply is cut off and
-  discarded, asks for the count and the records that matter instead of a copy
-  of a long tool result, and names the single key it wants — a model that
-  listed every record of a long result wrote a reply the output cap cut, and a
-  cut reply is never parsed. Both instructions are templates
-  (`compaction_turn_summary`, `compaction_fold_summary`), not literals, so an
-  operator serving another language has somewhere to put the translation.
-
-  What a pass is allowed to cost is bounded on every axis: a unit below
-  `compaction_summary_min_unit_tokens` is not sent at all (a summariser writes
-  a sentence or three whatever it is handed, so below some size the call is
-  spent to discover the summary is no smaller — adjacent units that are each
-  below it are joined, up to `compaction_summary_group_max_tokens`, and
-  summarised as one, so a history made only of short rounds can still shrink),
-  the word budget in the prompt
-  scales with the unit rather than being a fixed sentence count and is capped
-  at what the output cap can hold at
-  `compaction_summary_output_tokens_per_word` (four — the English figure of two
-  understates JSON escaping and a non-Latin script, and a budget sized that way
-  comes back cut off, never parses and is never committed) less
-  `compaction_summary_envelope_tokens` for the JSON around the words, and never
-  above what the grammar's own `maxLength` will accept, calls go out
-  `compaction_summariser_parallelism` at a time instead of one after another
-  while the run sits in `COMPACTING`, and the fold takes at most
-  `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
-  back no smaller than what it would replace is discarded, never committed.
-
-  A call that fails for a reason belonging to the unit — the request does not
-  fit the summariser's own window, or the reply carried no readable summary
-  because the output cap cut the envelope — is counted against THAT unit in
-  `CompactionState.failed_anchor_keys`, and past
-  `compaction_summary_failed_unit_max_attempts` the routine gate stops sending
-  it; the fold tier still gets its turn at it. Nothing else is counted: a
-  transport failure (a rate limit, a 5xx, a recycled summariser) says nothing
-  about the unit, and neither does a summary that merely came back no smaller,
-  so neither retires anything. The other units in the batch commit regardless,
-  so one unit the summariser cannot handle no longer keeps a pass from shedding
-  anything. The forced passes ignore the census and try every unit — they run
-  when the alternative is the run ending. The census rides the run snapshot,
-  and entries whose unit has left the transcript are pruned at the end of every
-  pass, so it does not grow without bound.
-
-  Separately from the census, a pass is charged to a retry budget bounded by
-  `compaction_failed_max_retries`. Only a pass that tried and failed is charged
-  — a tier raised, or a summariser call was made and nothing came of it — and
-  it is charged once, however many tiers failed. Routine and proactive passes
-  share `CompactionState.retry_count`; the reactive pass after a provider
-  rejection keeps `CompactionState.reactive_retry_count`, because it is the
-  only profile that may compact seeded history and proactive failures prove
-  nothing about it. Progress by either profile clears both counters, since the
-  next pass of either kind faces a different history, and `rearm()` clears
-  them too. A transport failure therefore costs the pass one retry and the
-  unit nothing, while a unit-shaped failure is counted against the unit as
-  well; the forced passes ignore the census either way. Both counters ride the
-  run snapshot.
-
-  A proactive pass (routine, turn-start emergency, per-iteration) is decided
-  before it opens. `ContextManager.has_proactive_work` asks each tier whether
-  it would change anything under the proactive profile, without changing it;
-  when none would — a history of seeded turns is the usual case — the gate
-  opens no transaction at all: no `COMPACTING`, no events, hooks, usage row or
-  snapshot. The engine remembers that probe with the history and the constants
-  it saw, and does not ask again until either changes. Past the budget, a
-  proactive pass does not end the run: nothing has been rejected yet, so the
-  proactive summariser tiers are suspended (a
-  `compaction_exhausted_proactive_suspended` state change each time a
-  proactive pass exhausts the budget; `retry_count` is not reset, so after the
-  suspension one failed pass suspends again) and the request goes out. Tier 1 needs no LLM and keeps running through the suspension. The
-  suspension ends after `compaction_proactive_suspension_iterations` gate
-  visits, or once the prompt has grown by
-  `compaction_proactive_suspension_growth_ratio` of its size when it began,
-  whichever comes first. A context refusal lifts it at once — the provider's,
-  or the local fit's refusal by estimate or exact count, both of which run the
-  reactive pass — and so do `rearm()` and a resume from a snapshot, which does
-  not carry it. A reactive pass past its budget hands the turn to the
-  output-cap ladder while a smaller cap is left, and fails the run only when
-  none is.
-
-  The routine per-iteration gate also stands down for
-  `compaction_no_gain_backoff_iterations` iterations after a pass that freed
-  less than `compaction_min_gain_ratio`; the count survives the per-message
-  recovery reset, which used to clear it before it could skip anything. The
-  backoff ends early once the prompt has grown by
-  `compaction_no_gain_backoff_growth_ratio` of its size when it was set, and on
-  any context refusal.
-
+- `runtime/context/compaction.py`, `runtime/context/carrier.py`,
+  `runtime/context/ledger.py` — the compaction cascade, specified in full in
+  [The compaction contract](compaction.md). A pass opens when the whole prompt
+  (history plus system prompt and tools) passes the trigger and aims at
+  `compaction_target_ratio` of it. **Masking** replaces old or oversized tool
+  outputs with a placeholder that names the tool, keeps the lines the output
+  said only once and points at the original in the blob store. **Summarising**
+  replaces the oldest spans — adjacent tool-pairing units joined up to
+  `compaction_summary_group_max_tokens` — with plain text under five fixed
+  headings, requested with `complete_text` under a system-role instruction and
+  read tolerantly; the **fold** merges runs of old summaries and operator
+  turns. The **floor** removes the oldest spans without a model when the tiers
+  above it stop short, so a pass always ends below the trigger or with nothing
+  left to remove. Every tier first records what it removes in the **ledger** —
+  operator words, files, exact values, failed calls, the latest plan — one
+  message rebuilt by code on every pass and never shown to the summariser. An
+  operator turn is never summarised, tool pairs stay whole, and turns seeded
+  from an earlier run are touched only by reactive recovery, each replacement
+  keeping the seed tag. `compaction_completed` reports every tier and the
+  pass's `outcome`; both instructions are templates
+  (`compaction_turn_summary`, `compaction_fold_summary`).
 - `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
   call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it
   rewrites the REQUEST view only — `engine.history` keeps every byte, so
