@@ -8,6 +8,13 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A failed round never completes on an earlier run's answer.** Completing a
+  failed run "on its preserved answer" read every message not tagged as
+  seeded, so on a host that hands the engine a session's earlier turns
+  untagged, the previous run's reply counted: a run whose every request was
+  refused completed with nothing written and no error reported. The answer
+  must now have been written in the round that failed, the span after the
+  last message a caller put in.
 - **A refusal the adapter classified as final is neither retried nor wound
   down.** The retry decision read only the `reason` of an attached
   classification and ignored its `retryable` flag, although `ClassifiedLike`

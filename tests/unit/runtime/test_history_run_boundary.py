@@ -532,14 +532,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "request; it reaches no engine and selects nothing"
     ),
     # --- identity lookups keyed on a tool call id ---------------------------
-    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
-        "asks whether there is anything a final answer could be about, and "
-        "looks only after the LAST message the caller put in — the operator's "
-        "task, or the tool result a parked run was resumed with. A seeded turn "
-        "precedes that message, so nothing from an earlier run is in the span "
-        "it walks",
-        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
-    ),
     "protocore/runtime/query.py::_tool_name_for_call_id": _run_scoped(
         "resolves ONE tool_call_id to its tool name; a call id identifies a "
         "single call, so the search cannot land on another run's",
@@ -569,6 +561,18 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
             "structural check that ONE approved tool call matches its pending tool_use block",
             f"{_CLAIMS}::test_pending_tool_use_assertion_is_keyed_on_the_approved_call",
         )
+    ),
+    # --- what the round now driving has produced ----------------------------
+    "protocore/runtime/query.py::_this_round_messages": _run_scoped(
+        "answers about the round now driving: it starts at the message AFTER "
+        "the last one a caller put in — the operator's prompt, or the tool "
+        "result a parked run was resumed with — so a prior run's prose and "
+        "tool calls precede the boundary and cannot answer it. The boundary is "
+        "re-derived rather than taken from the seed tag because the tag is set "
+        "by the executor and not by every host, and a host that hands over a "
+        "session's earlier turns verbatim would otherwise have the predicate "
+        "answer for a run that is over",
+        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
     ),
     # --- the tail --------------------------------------------------------
     "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected": _run_scoped(

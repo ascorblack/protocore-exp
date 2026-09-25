@@ -7124,6 +7124,28 @@ def _dispatch_outcome_is_terminal(
 # ---------------------------------------------------------------------------
 
 
+def _this_round_messages(engine: QueryEngine) -> list[Message]:
+    """The messages after the last one a caller put in, in history order.
+
+    The caller's message is the operator's prompt or steer, or the tool result a
+    parked run was resumed with; the runtime's own nudges are flagged
+    :data:`SYNTHETIC_RECOVERY_METADATA_KEY` and do not start a round. This
+    boundary is used rather than :func:`_this_run_messages` because the seed
+    tag that one reads is set by the executor and not by every host: a host that
+    hands the engine a session's earlier turns verbatim would have a run-scoped
+    predicate answer for a previous run. Anything after the last caller message
+    belongs to the round now driving, whoever assembled the history.
+    Pure / total — never raises.
+    """
+    start = 0
+    for index, message in enumerate(engine.history):
+        if message.role is MessageRole.user and not message.metadata.get(
+            SYNTHETIC_RECOVERY_METADATA_KEY
+        ):
+            start = index + 1
+    return engine.history[start:]
+
+
 def _run_produced_output(engine: QueryEngine) -> bool:
     """Whether the current run has anything a final answer could be about.
 
@@ -7132,26 +7154,15 @@ def _run_produced_output(engine: QueryEngine) -> bool:
     round reasoning and then lost the endpoint has nothing to tell the user
     about, and the reasoning is not shown to them anyway.
 
-    The run's own turns are the ones after the last message the CALLER put in —
-    the operator's prompt, or the tool result a parked run was resumed with.
-    That boundary is used rather than :func:`_this_run_messages` because the
-    seed tag that helper reads is set by the executor and not by every host: a
-    host that hands the engine a session's earlier turns verbatim would have
-    the predicate answer for a previous run. Anything after the last caller
-    message belongs to the round now driving, whoever assembled the history.
+    The run's own turns are :func:`_this_round_messages`, so a previous run's
+    prose in an untagged history cannot answer for this one.
 
     Asked by the provider-failure policy before it winds a run down. A
     wind-down is a request for the best answer the evidence supports; put to a
     run with no evidence it produces an invented one, which is worse than the
     error it replaced. Pure / total — never raises.
     """
-    start = 0
-    for index, message in enumerate(engine.history):
-        if message.role is MessageRole.user and not message.metadata.get(
-            SYNTHETIC_RECOVERY_METADATA_KEY
-        ):
-            start = index + 1
-    for message in engine.history[start:]:
+    for message in _this_round_messages(engine):
         if message.role is MessageRole.tool:
             return True
         if message.role is not MessageRole.assistant:
@@ -7963,6 +7974,26 @@ def _preserve_completed_answer_on_stream_error(engine: QueryEngine) -> bool:
 
     rc = engine.config.rc
     if not getattr(rc, "preserve_completed_answer_on_stream_error", False):
+        return False
+    # The answer must have been written in the round that failed. The prose
+    # check below reads :func:`_this_run_messages`, which trusts the seed tag,
+    # and a host that hands over the session's earlier turns untagged made the
+    # PREVIOUS run's reply count: a run whose provider refused every request
+    # completed "on its preserved answer" having written nothing, and the
+    # operator was shown no reply and no error. The round boundary does not
+    # depend on the tag. With an answer in the round, the latest substantive
+    # prose is that answer, so the prose check still decides whether work came
+    # after it.
+    floor = max(1, rc.finalize_prose_gate_min_chars)
+    answered_in_round = any(
+        isinstance(block, TextBlock) and len(block.text.strip()) >= floor
+        for message in _this_round_messages(engine)
+        if message.role is MessageRole.assistant
+        and not message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        and message.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is not True
+        for block in message.content_blocks
+    )
+    if not answered_in_round:
         return False
     return _has_visible_assistant_prose_after_work(
         engine,

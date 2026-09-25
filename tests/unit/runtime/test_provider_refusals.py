@@ -1,4 +1,4 @@
-"""A provider that refuses the request for good.
+"""A provider that refuses the request for good, and a run that has nothing to show for it.
 
 The live shape: the provider answered every attempt with a 400
 ``invalid_request_error`` — the client was too old for the model. A failure
@@ -6,10 +6,17 @@ the adapter marks as permanent, by the flag on the classification it attaches
 or by the reason when it sets no flag, is not retried in place and does not
 wind down against the endpoint that refused it; it may still step to the next
 model of the chain, which is bounded and one-way.
+
+And with the retries spent and no word written, the run completed "on its
+preserved answer": the answer it found was the PREVIOUS run's reply, which the
+host had handed the engine as plain session history. "Answer preserved" means
+an answer written in the round that failed, never prose from before the
+operator's latest message, whether or not the host tagged that prose as seeded.
 """
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -20,7 +27,17 @@ from protocore.contracts.llm import (
     LLMStreamEvent,
 )
 from protocore.contracts.runtime_constants import LoopConstants
-from protocore.contracts.types import Message, MessageRole, StopReason, TextBlock
+from protocore.contracts.tools import Tool, ToolContext
+from protocore.contracts.types import (
+    TERMINAL_TOOL_METADATA_KEY,
+    Message,
+    MessageRole,
+    StopReason,
+    TextBlock,
+    ToolDefinition,
+    ToolParameterSchema,
+    ToolResult,
+)
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
@@ -257,3 +274,84 @@ async def test_a_permanent_refusal_falls_back_to_a_rung_that_answers(
     assert engine.state is LoopState.COMPLETED
     assert engine.config.model_name == "m1"
     assert len(llm.calls) == 2
+
+
+# -- "answer preserved" needs an answer ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _classified(LLMProviderError(_REFUSAL), "format_error", False),
+        LLMProviderError("HTTP 502: bad gateway"),
+    ],
+    ids=["permanent", "transient-exhausted"],
+)
+@pytest.mark.asyncio
+async def test_a_failure_before_any_text_never_completes_on_an_earlier_runs_answer(
+    engine_factory, in_memory_runtime, error: BaseException
+) -> None:
+    """The live shape: the host hands over the session's earlier turns untagged."""
+    engine = engine_factory(rc=_rc())
+    engine.history = [
+        _user("summarise the release notes"),
+        _assistant("Here is the complete summary of the release notes you asked for."),
+    ]
+    llm = _ScriptedLLM([error, error, error, error])
+    engine.llm = llm  # type: ignore[assignment]
+
+    events = await _drive(engine)
+
+    assert "stream_error_completed_answer_preserved" not in _reasons(events)
+    assert engine.state is LoopState.FAILED
+    assert _terminal_stop(events)["stop_reason"] == StopReason.error.value
+    assert _errors(events), "the operator must be told why the run ended"
+
+
+class _FinalAnswerTool(Tool):
+    """The run's terminal tool, so the call owed after an answer is actually requested."""
+
+    @property
+    def name(self) -> str:
+        return "final_answer"
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="final_answer",
+            description="end the run",
+            parameters=ToolParameterSchema(properties={"message": {"type": "string"}}),
+        )
+
+    async def invoke(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        return ToolResult(
+            tool_call_id="", content="done", metadata={TERMINAL_TOOL_METADATA_KEY: True}
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_written_in_this_round_is_still_preserved(
+    engine_factory, in_memory_runtime
+) -> None:
+    """A forced continuation that fails does not bury the reply already given."""
+    in_memory_runtime["tools"].register(_FinalAnswerTool())  # type: ignore[attr-defined]
+    engine = engine_factory(
+        rc=_rc(llm_transient_error_retry_max_attempts=1, terminal_tool_nudge_enabled=True),
+        expected_terminal_tool="final_answer",
+    )
+    engine.history = [
+        _user("an earlier question"),
+        _assistant("An earlier, complete and substantive reply to that question."),
+    ]
+    prose = "Here is the complete and substantive answer to this question."
+    llm = _ScriptedLLM(
+        [None, LLMRateLimitError("429"), LLMRateLimitError("429"), LLMRateLimitError("429")],
+        prose_first=prose,
+    )
+    engine.llm = llm  # type: ignore[assignment]
+
+    events = await _drive(engine)
+
+    assert "stream_error_completed_answer_preserved" in _reasons(events)
+    assert engine.state is LoopState.COMPLETED
+    assert engine.has_final_answer is True

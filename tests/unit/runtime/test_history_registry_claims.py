@@ -77,7 +77,7 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
         "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected",
     ),
     "test_produced_output_ignores_a_seeded_prior_run": (
-        "protocore/runtime/query.py::_run_produced_output",
+        "protocore/runtime/query.py::_this_round_messages",
     ),
     "test_call_id_lookups_resolve_the_call_they_are_asked_for": (
         "protocore/runtime/query.py::_tool_name_for_call_id",
