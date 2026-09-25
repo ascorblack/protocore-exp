@@ -1042,6 +1042,41 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_permanent_refusal_after_work_is_not_wound_down() -> None:
+    """The wind-down's turn goes to the endpoint that has just refused the run for good.
+
+    It carries the same history and one more message, so it is refused the same
+    way: the run fails a turn later, and a host that reads the notice's cause
+    reports a wind-down where the provider had refused the request. A refusal
+    the adapter classified as final ends the run on the provider's own words.
+    """
+
+    class _Verdict:
+        reason = "format_error"
+        retryable = False
+
+    refusal = LLMProviderError("HTTP 400: this client version is no longer supported")
+    object.__setattr__(refusal, "classified", _Verdict())
+    rc = LoopConstants(model_context_window=4_096)
+    llm = _FailsOnLLM(
+        [{"tool": "Read", "args": {"x": "a"}}, {"text": "what I found so far"}],
+        refusal,
+        fail_on={2, 3, 4},
+    )
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    reasons = [e.payload.get("reason") for e in events if e.type is EventType.STATE_CHANGED]
+    assert "soft_stop_notified" not in reasons
+    assert "transient_llm_error_retry" not in reasons
+    assert len(llm.calls) == 2
+    assert engine.state is LoopState.FAILED
+    errors = [e.payload for e in events if e.type is EventType.ERROR]
+    assert errors and "no longer supported" in str(errors[-1].get("message"))
+
+
+@pytest.mark.asyncio
 async def test_a_provider_failure_the_wind_down_cannot_rescue_still_reports_it() -> None:
     """The original error is surfaced, not buried under a silent no-answer stop."""
     rc = LoopConstants(model_context_window=4_096, soft_stop_max_turns=1)

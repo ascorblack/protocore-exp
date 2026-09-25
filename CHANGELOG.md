@@ -8,6 +8,13 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A refusal the adapter classified as final is neither retried nor wound
+  down.** The retry decision read only the `reason` of an attached
+  classification and ignored its `retryable` flag, although `ClassifiedLike`
+  carries both; the flag now decides when it is set. And a permanent
+  `LLMProviderError` no longer enters the wind-down: its one turn is a request
+  to the endpoint that has just refused the run, and it was refused the same
+  way. The fallback chain is still tried first.
 - **The wind-down notice names a deadline and a stalled model for what they
   are.** A run stopped by its wall clock was told it had reached its budget,
   and a run whose model kept returning reasoning with no answer and no tool

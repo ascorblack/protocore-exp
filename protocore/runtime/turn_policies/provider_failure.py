@@ -242,13 +242,19 @@ class ProviderFailurePolicy:
             # request. The first two pass on a retry and the third costs one
             # more call against a cached prompt, so the bounded retry comes
             # before the wind-down here too — unless the adapter, which had the
-            # response in front of it, said the failure is permanent.
+            # response in front of it, said the failure is permanent. Then the
+            # wind-down is skipped as well: its one turn is a request to the
+            # endpoint that has just refused the run, with the same history and
+            # one more message, and it is refused the same way. The chain is the
+            # only recovery left, and otherwise the run fails on the provider's
+            # own words.
+            retryable = _says_retryable(exc)
             async for event in self._recover(
                 turn,
                 exc,
                 kind="llm_provider_error",
-                retryable=_says_retryable(exc),
-                wind_down_when_stuck=True,
+                retryable=retryable,
+                wind_down_when_stuck=retryable,
             ):
                 yield event
             return
@@ -488,11 +494,21 @@ def _says_retryable(exc: LLMError) -> bool:
     and the body and pins the verdict on what it raises. The class defaults in
     :mod:`protocore.contracts.llm` are what an adapter that classified nothing
     gets, so this policy never has to guess. An adapter may also attach its
-    classification without touching the flag; a reason that names a permanent
-    answer then outranks the class default.
+    classification (:class:`~protocore.contracts.resilience.ClassifiedLike`)
+    without touching the exception's flag: the classification's ``retryable``
+    then decides, and a classification that carries no flag is read by its
+    reason, where one naming a permanent answer outranks the class default.
     """
     if not exc.retryable:
         return False
+    # The verdict's own flag outranks its reason. The adapter set both from the
+    # same response, and the flag is its answer to exactly this question; the
+    # reason is a coarser name that can say "server_error" about a reply whose
+    # body the adapter read as final.
+    classified = getattr(exc, "classified", None)
+    flag = getattr(classified, "retryable", None) if classified is not None else None
+    if isinstance(flag, bool):
+        return flag
     return _classified_reason(exc) not in _PERMANENT_FAILURE_REASONS
 
 
