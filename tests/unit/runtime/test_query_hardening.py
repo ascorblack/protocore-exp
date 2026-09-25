@@ -4202,3 +4202,39 @@ async def test_the_no_gain_backoff_skips_iterations_in_a_real_run(
     ]
     # Five tool iterations: a pass, two skipped, a pass, one skipped.
     assert len(per_iteration) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_compaction_the_pre_compact_hook_refuses_leaves_the_run_running(
+    engine_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal returned from inside COMPACTING and left the run there for the rest of the turn."""
+    import protocore.runtime.correctness_bind as correctness_bind
+    from protocore.contracts.middleware import LifecycleOutcome, LifecycleVerdict
+    from protocore.runtime.query import _run_compaction
+
+    rc = LoopConstants(model_context_window=65_536, compaction_keep_recent_turns=1)
+    engine = engine_factory(rc=rc)
+    engine.history.extend(
+        [message.model_copy(update={"metadata": {}}) for message in _seeded_prior_turns()]
+    )
+    engine.history.append(Message(role=MessageRole.user, content_blocks=[TextBlock(text="go on")]))
+    real_fire = correctness_bind.fire_lifecycle
+
+    async def _refuse_pre_compact(engine_: Any, event: HookEvent, payload: Any) -> Any:
+        if event is HookEvent.pre_compact:
+            return LifecycleOutcome(payload=dict(payload), verdict=LifecycleVerdict.deny, reason="not now"), None
+        return await real_fire(engine_, event, payload)
+
+    monkeypatch.setattr(correctness_bind, "fire_lifecycle", _refuse_pre_compact)
+    engine.state = LoopState.RUNNING
+
+    events = [event async for event in _run_compaction(engine, force=True)]
+
+    assert engine.state is LoopState.RUNNING
+    assert [
+        event.payload.get("reason")
+        for event in events
+        if event.type is EventType.STATE_CHANGED
+    ][-1] == "compaction_refused_by_hook"
+    assert not [event for event in events if event.type is EventType.COMPACTION_COMPLETED]

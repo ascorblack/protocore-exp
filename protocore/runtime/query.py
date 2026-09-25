@@ -2647,7 +2647,9 @@ async def _run_compaction(
         yield pre_compact_evt
     if not pre_compact.allowed:
         # Compaction is a transaction, and this is the seam that can refuse to
-        # open it. Nothing was written, so there is nothing to roll back.
+        # open it. Nothing was written, so there is nothing to roll back — but
+        # the run was moved into COMPACTING above, and a refusal that returned
+        # from there left it in that state for the rest of the turn.
         yield TurnEvent(
             type=EventType.HOOK_FIRED,
             run_id=engine.config.run_id,
@@ -2656,6 +2658,11 @@ async def _run_compaction(
                 "decision": pre_compact.verdict.value,
                 "reason": pre_compact.reason,
             },
+        )
+        refused_from = engine.state
+        engine.transition_to(LoopState.RUNNING)
+        yield _emit_state_change(
+            engine, refused_from, LoopState.RUNNING, reason="compaction_refused_by_hook"
         )
         return
     async def _record_summariser_request(request: LLMRequest) -> None:

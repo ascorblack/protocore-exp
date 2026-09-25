@@ -8,6 +8,10 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A compaction the `pre_compact` hook refuses leaves the run running.** The
+  refusal returned from inside `COMPACTING`, and the run stayed in that state
+  for the rest of the turn. It now returns to `RUNNING` with the reason
+  `compaction_refused_by_hook`.
 - **The compaction gate sizes the whole prompt.** The trigger and the
   emergency cliff are whole-prompt sizes, but the gate held the history's
   estimate against them. With a large system prompt and tool surface — 56k of
