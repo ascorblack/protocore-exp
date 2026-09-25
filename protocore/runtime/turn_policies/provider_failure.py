@@ -11,9 +11,13 @@ recoveries, not by five separate opinions about the same question:
    bet is wrong. Whether a failure is that kind of failure is a
    classification the adapter attached to it; an unclassified error never
    moves the chain.
-2. **The same endpoint, later.** Only for the two classes that are
-   transient by definition, bounded per consecutive-failure streak, and only
-   once the chain has nothing left to offer.
+2. **The same endpoint, later.** Only for failures that can pass on their
+   own, bounded per consecutive-failure streak, and only once the chain has
+   nothing left to offer. A failure the adapter marked as permanent — a
+   refused request, a client the provider considers too old, a refused key,
+   an unknown model — gets neither this nor a wind-down: the same request to
+   the same endpoint is refused the same way, so retrying it only delays the
+   error and a wind-down asks the refusing endpoint for one more turn.
 3. **The answer the run already has.** The model has whatever evidence it
    gathered and the partial it produced is in the transcript, so one narrowed
    turn usually turns that into an answer. The original error is stashed
@@ -52,6 +56,7 @@ from protocore.logging_utils import get_logger
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.error_kinds import INTERNAL_ERROR_KIND
 from protocore.runtime.events import TurnEvent
+from protocore.runtime.resilience import is_permanent_failure
 from protocore.runtime.turn_policies import RunCounter
 from protocore.runtime.turn_policies.run_ceilings import (
     TerminalEmitter,
@@ -218,11 +223,21 @@ class ProviderFailurePolicy:
 
         if isinstance(exc, LLMProviderError):
             # The adapters' catch-all: a 5xx, a dropped connection, a refused
-            # request. The first two pass on a retry and the third costs one
-            # more call against a cached prompt, so the bounded retry comes
-            # before the wind-down here too.
+            # request. The first two pass on a retry, so the bounded retry
+            # comes before the wind-down. The third does not, and it used to be
+            # retried all the same: a provider that answered every attempt
+            # with a 400 was asked twice more, and the operator waited through
+            # the backoff for an error that was known on the first reply. When
+            # the adapter says the failure is permanent, the chain is the only
+            # recovery left — a different model may serve the request — and
+            # otherwise the run fails on the provider's own words.
+            permanent = is_permanent_failure(exc)
             async for event in self._recover(
-                turn, exc, kind="llm_provider_error", retryable=True, wind_down_when_stuck=True
+                turn,
+                exc,
+                kind="llm_provider_error",
+                retryable=not permanent,
+                wind_down_when_stuck=not permanent,
             ):
                 yield event
             return

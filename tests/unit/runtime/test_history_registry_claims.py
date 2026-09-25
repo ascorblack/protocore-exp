@@ -49,11 +49,11 @@ from protocore.runtime.context.compaction import _session_history_seed_indices
 from protocore.runtime.longfile_convergence import _active_file_tail
 from protocore.runtime.query import (
     _apply_updated_input,
-    _run_produced_output,
     _assert_history_has_matching_pending_tool_use,
     _history_has_tool_result,
     _history_tool_result_is_terminal,
     _prose_gate_just_injected,
+    _run_produced_output,
     _tool_call_from_history,
     _tool_name_for_call_id,
 )
@@ -91,7 +91,7 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
         "protocore/runtime/longfile_convergence.py::_active_file_tail",
     ),
     "test_produced_output_is_about_the_round_now_driving": (
-        "protocore/runtime/query.py::_run_produced_output",
+        "protocore/runtime/query.py::_this_round_messages",
     ),
     "test_seed_indices_select_every_seeded_turn_and_nothing_else": (
         "protocore/runtime/context/compaction.py::_session_history_seed_indices",

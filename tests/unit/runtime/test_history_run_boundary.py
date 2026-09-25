@@ -531,7 +531,7 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         )
     ),
     # --- what the round now driving has produced ----------------------------
-    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
+    "protocore/runtime/query.py::_this_round_messages": _run_scoped(
         "answers about the round now driving: it starts at the message AFTER "
         "the last one a caller put in — the operator's prompt, or the tool "
         "result a parked run was resumed with — so a prior run's prose and "
