@@ -11,7 +11,7 @@ line exists, and this file will say so when it does.
 **Please do not open a public issue for a security problem.**
 
 Report it privately through GitHub's
-[private vulnerability reporting](https://github.com/ascorblack-labs/protocore-community/security/advisories/new)
+[private vulnerability reporting](https://github.com/anchor-inference/protocore/security/advisories/new)
 on this repository. Enable that feature under *Settings → Code security* if
 the link does not resolve; until it is on, please contact a maintainer
 directly rather than filing publicly.

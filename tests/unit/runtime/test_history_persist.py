@@ -338,7 +338,14 @@ async def test_a_restored_snapshot_does_not_trust_the_marker(
     persist_history(engine)
     snapshot = engine.snapshot()
 
+    # An engine that has a marker of its own, so the assertion is about the
+    # restore clearing it rather than about a fresh engine never having had one.
     resumed = engine_factory()
+    _attach(resumed, _RecordingStore())
+    resumed.history.append(_msg("something this process persisted"))
+    persist_history(resumed)
+    assert resumed.persisted_history_marker is not None
+
     await resumed.resume_from_snapshot(snapshot)
 
     assert resumed.persisted_history_marker is None

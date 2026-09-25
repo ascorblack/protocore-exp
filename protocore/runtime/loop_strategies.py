@@ -37,6 +37,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from protocore.contracts.llm import (
+    LLMContextWindowExceeded,
     LLMError,
     ProviderDeltaKind,
 )
@@ -306,6 +307,7 @@ class DeepStrategy:
             _repair_outbound_tool_pairing,
             build_llm_request,
         )
+        from protocore.runtime.request_budget import fit_request_to_context
 
         rc = engine.config.rc
         include_summary = bool(getattr(rc, "agent_deep_plan_include_summary", False))
@@ -363,6 +365,16 @@ class DeepStrategy:
                 call_category="planning",
             ),
         )
+        try:
+            request = fit_request_to_context(request, rc)
+        except LLMContextWindowExceeded as exc:
+            _logger.warning(
+                "DIAG deep_strategy.plan_context_overflow run=%s tenant=%s error=%s",
+                engine.config.run_id,
+                engine.config.tenant_id,
+                type(exc).__name__,
+            )
+            return None
 
         # Only the forced ``plan`` tool's final args are accepted. The model is
         # pinned to ``tool_choice=plan`` and the surface is plan-only, but a
@@ -492,6 +504,7 @@ class DeepStrategy:
             _observability_context,
             build_llm_request,
         )
+        from protocore.runtime.request_budget import fit_request_to_context
 
         rc = engine.config.rc
         instruction = _plan_fallback_instruction(surface_names, include_summary)
@@ -518,6 +531,17 @@ class DeepStrategy:
                     call_category="planning",
                 ),
             )
+            try:
+                request = fit_request_to_context(request, rc)
+            except LLMContextWindowExceeded as exc:
+                _logger.warning(
+                    "DIAG deep_strategy.plan_fallback_context_overflow run=%s "
+                    "tenant=%s error=%s",
+                    engine.config.run_id,
+                    engine.config.tenant_id,
+                    type(exc).__name__,
+                )
+                return None
             text_parts: list[str] = []
             # Fix #4 — also capture any native CoT the fallback rung emits. The
             # ``json_object`` rung keeps CoT off, but the ``plain`` rung may still

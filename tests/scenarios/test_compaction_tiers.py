@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.llm import LLMRequest
+from protocore.contracts.llm import LLMContextWindowExceeded, LLMRequest
 from protocore.contracts.types import StopReason
 from protocore.runtime.events import EventType
 from protocore.tests_support.adapters import InMemoryLLMProvider
@@ -68,6 +68,7 @@ def _tiered_rc(**overrides: Any) -> Any:
     """Constants that put all three tiers within reach of a short scenario."""
     values: dict[str, Any] = {
         "model_context_window": 2_048,
+        "request_context_safety_tokens": 0,
         "compaction_trigger_ratio": 0.4,
         "compaction_emergency_ratio": 0.6,
         "compaction_keep_recent_turns": 2,
@@ -239,7 +240,8 @@ async def test_every_identifier_reaches_the_summariser_verbatim(
     for identifier in identifiers:
         assert identifier in seen, f"{identifier!r} never reached the summariser"
     assert all(
-        "verbatim" in prompt and "never round, guess or substitute" in prompt for prompt in per_turn
+        "verbatim" in prompt and "never round, guess or substitute" in prompt
+        for prompt in per_turn
     )
 
 
@@ -346,5 +348,73 @@ async def test_a_cold_resume_does_not_re_summarise_what_was_already_summarised(
     # key the snapshot brought back.
     resumed_snapshot = resumed.engine.snapshot()
     assert already <= set(resumed_snapshot["compaction"]["summarised_turn_ids"])
+    # The per-unit failure census rides the same snapshot: a resumed run that
+    # started it from zero would pay again for units already proved unsummarisable.
+    assert "failed_anchor_keys" in snapshot["compaction"]
+    assert "failed_anchor_keys" in resumed_snapshot["compaction"]
     fresh_prompts = [call.messages[0].text for call in summariser.calls[calls_before:]]
     assert all("<compacted-turn" not in prompt.split("</turn>")[0] for prompt in fresh_prompts)
+
+
+class RefusingSummariser(InMemoryLLMProvider):
+    """Refuses every unit the way a provider refuses one too large for it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.structured_calls = 0
+
+    async def complete_structured(
+        self, request: LLMRequest, response_schema: dict[str, Any]
+    ) -> Any:
+        self.structured_calls += 1
+        raise LLMContextWindowExceeded("the unit does not fit the summariser")
+
+
+async def test_a_populated_failure_census_survives_a_cold_resume(
+    scenario: ScenarioFactory,
+) -> None:
+    """The counts, not just the key, cross the process boundary.
+
+    A resumed run that started the census from zero would buy the same
+    unsummarisable units all over again, once an iteration, for the rest of
+    the run.
+    """
+    summariser = RefusingSummariser()
+    tool = ScriptedTool(tool_name="Note", content="R" * 4_000)
+    first = scenario(
+        rc=_tiered_rc(compaction_summary_failed_unit_max_attempts=5),
+        tools=[tool],
+        compaction_provider=summariser,
+    )
+
+    await _long_conversation(first, turns=8, tool=tool)
+    snapshot = first.engine.snapshot()
+    census = snapshot["compaction"]["failed_anchor_keys"]
+    assert census, "no unit failed, so the resume proves nothing"
+    assert all(count >= 1 for count in census.values())
+
+    resumed = scenario(
+        rc=_tiered_rc(compaction_summary_failed_unit_max_attempts=5),
+        tools=[tool],
+        compaction_provider=summariser,
+    )
+    await resumed.engine.resume_from_snapshot(snapshot)
+
+    restored = resumed.engine.compaction_state.failed_anchor_keys
+    assert restored == {str(key): int(count) for key, count in census.items()}
+
+
+async def test_both_retry_budgets_survive_a_cold_resume(
+    scenario: ScenarioFactory,
+) -> None:
+    """A resumed run keeps what each profile has already spent."""
+    first = scenario(rc=_tiered_rc())
+    first.engine.compaction_state.retry_count = 1
+    first.engine.compaction_state.reactive_retry_count = 2
+    snapshot = first.engine.snapshot()
+
+    resumed = scenario(rc=_tiered_rc())
+    await resumed.engine.resume_from_snapshot(snapshot)
+
+    assert resumed.engine.compaction_state.retry_count == 1
+    assert resumed.engine.compaction_state.reactive_retry_count == 2

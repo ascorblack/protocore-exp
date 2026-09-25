@@ -59,6 +59,7 @@ from protocore.contracts import (
     IHookManager,
     ILifecycleRegistry,
     ILLMProvider,
+    IRequestTokenCounter,
     IRunStore,
     ISearchIndex,
     ISessionStore,
@@ -136,7 +137,7 @@ from protocore.runtime.token_counting import (
 from protocore.safety import DefaultShellSafetyPolicy, ShellPolicyDecision
 from protocore.tools import tool
 
-__version__ = "2.0.0-alpha.1"
+__version__ = "2.0.0a21"
 
 # Categorized re-export surface — intentionally NOT alphabetically sorted.
 __all__ = [  # noqa: RUF022
@@ -167,6 +168,7 @@ __all__ = [  # noqa: RUF022
     "LifecycleScope",
     "LifecycleVerdict",
     "ILLMProvider",
+    "IRequestTokenCounter",
     "IRunStore",
     "ISearchIndex",
     "ISessionStore",

@@ -5,6 +5,10 @@ from collections.abc import Iterator
 
 import pytest
 
+from protocore.constants import (
+    MAX_TOOL_SURFACE_AUDIENCES,
+    MAX_TOOL_SURFACE_CACHE_ENTRIES,
+)
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import ToolDefinition, ToolParameterSchema
 from protocore.runtime import token_counting
@@ -156,3 +160,57 @@ def test_the_returned_descriptions_are_a_copy() -> None:
     taken["read"] = "something else"
 
     assert surface_descriptions(surface.digest) == {"read": "reads a file"}
+
+
+def test_only_so_many_surfaces_are_remembered() -> None:
+    """A process that somehow meets a new surface per run does not accumulate."""
+    digests = [
+        read_tool_surface((_tool(f"tool_{i}", f"description {i}"),)).digest
+        for i in range(MAX_TOOL_SURFACE_CACHE_ENTRIES + 3)
+    ]
+
+    assert surface_descriptions(digests[-1]) is not None
+    assert surface_descriptions(digests[0]) is None
+
+
+def test_evicting_a_surface_also_drops_the_claims_on_it() -> None:
+    """A claim outliving the descriptions would be a promise nobody can keep.
+
+    The claim says the reader was told and can be left to its own copy. Once
+    this process can no longer answer a lookup for that digest, the reader that
+    lost its copy has nowhere to go, so the next advertisement describes the
+    surface again rather than naming something unresolvable.
+    """
+    first = read_tool_surface((_tool("read", "reads a file"),)).digest
+    note_surface_described(first, "session-a")
+    assert surface_needs_describing(first, "session-a") is False
+
+    for i in range(MAX_TOOL_SURFACE_CACHE_ENTRIES + 1):
+        read_tool_surface((_tool(f"other_{i}", f"description {i}"),))
+
+    assert surface_descriptions(first) is None
+    assert surface_needs_describing(first, "session-a") is True
+
+
+def test_a_surface_still_in_use_keeps_its_claims() -> None:
+    """Eviction is by least-recent use, and reading a surface is a use."""
+    first = read_tool_surface((_tool("read", "reads a file"),)).digest
+    note_surface_described(first, "session-a")
+
+    for i in range(MAX_TOOL_SURFACE_CACHE_ENTRIES - 1):
+        read_tool_surface((_tool(f"other_{i}", f"description {i}"),))
+        read_tool_surface((_tool("read", "reads a file"),))
+
+    assert surface_descriptions(first) is not None
+    assert surface_needs_describing(first, "session-a") is False
+
+
+def test_only_so_many_readers_are_remembered() -> None:
+    digest = read_tool_surface((_tool("read"),)).digest
+    for i in range(MAX_TOOL_SURFACE_AUDIENCES + 2):
+        note_surface_described(digest, f"session-{i}")
+
+    # The oldest reader is told what its tools do a second time; the newest
+    # readers are not.
+    assert surface_needs_describing(digest, "session-0") is True
+    assert surface_needs_describing(digest, f"session-{MAX_TOOL_SURFACE_AUDIENCES + 1}") is False

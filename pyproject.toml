@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "protocore"
-version = "2.0.0a4"
+version = "2.0.0a21"
 description = "Protocol-first pure core for LLM agent orchestration"
 readme = "README.en.md"
 requires-python = ">=3.12"
@@ -48,9 +48,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ascorblack-labs/protocore-community"
-Source = "https://github.com/ascorblack-labs/protocore-community"
-Issues = "https://github.com/ascorblack-labs/protocore-community/issues"
+Homepage = "https://github.com/anchor-inference/protocore"
+Source = "https://github.com/anchor-inference/protocore"
+Issues = "https://github.com/anchor-inference/protocore/issues"
 
 [tool.hatch.build.targets.sdist]
 # An allowlist, not an exclude list. A source archive that opts out by name

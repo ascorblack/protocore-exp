@@ -27,6 +27,7 @@ LONG = "x" * 6_000
 def _compacting_rc(**overrides: object) -> object:
     values: dict[str, object] = {
         "model_context_window": 512,
+        "request_context_safety_tokens": 0,
         "compaction_trigger_ratio": 0.5,
         "compaction_keep_recent_turns": 1,
     }
@@ -98,13 +99,14 @@ async def test_the_proactive_switches_do_not_reach_the_turn_start_gate(
     assert EventType.COMPACTION_STARTED in [evt.type for evt in produced]
 
 
-async def test_the_provider_reported_prompt_size_can_trigger_a_compaction(
+async def test_provider_count_from_an_old_request_does_not_trigger_compaction(
     scenario: ScenarioFactory,
 ) -> None:
-    """The char estimate under-counts; the real number the provider reports floors it."""
+    """A scalar from one wire envelope cannot size the next one by itself."""
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_keep_recent_turns=1,
         ),
@@ -120,7 +122,8 @@ async def test_the_provider_reported_prompt_size_can_trigger_a_compaction(
 
     produced = await run.run("small question")
 
-    assert EventType.COMPACTION_STARTED in [evt.type for evt in produced]
+    assert EventType.COMPACTION_STARTED not in [evt.type for evt in produced]
+    assert len(run.requests) == 2
 
 
 async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
@@ -137,18 +140,22 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_emergency_ratio=0.8,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note")],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 1_700)],
     )
-    run.llm.queue_tool_call_response(
-        tool_call_id="call-1",
-        tool_name="Note",
-        tool_input={},
-        usage_input_tokens=900,
-    )
+    # Two results: the second is the batch just produced and stays protected,
+    # so the first is what the forced pass has to work on. A pass with nothing
+    # eligible is not opened at all, so it would show no reason to assert on.
+    for call_id in ("call-1", "call-2"):
+        run.llm.queue_tool_call_response(
+            tool_call_id=call_id,
+            tool_name="Note",
+            tool_input={},
+        )
     run.llm.queue_response(text="after the cliff was cleared")
 
     produced = await run.run("small question")
@@ -159,6 +166,7 @@ async def test_a_prompt_over_the_cliff_is_compacted_unconditionally(
         if evt.type is EventType.COMPACTION_STARTED
     ]
     assert "proactive_per_iteration_emergency" in reasons
+    assert "reactive_413" not in reasons
 
 
 async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
@@ -168,19 +176,22 @@ async def test_the_cliff_switch_leaves_the_ordinary_gate_running(
     run = scenario(
         rc=default_rc(
             model_context_window=1_000,
+            request_context_safety_tokens=0,
             compaction_trigger_ratio=0.5,
             compaction_emergency_ratio=0.8,
             compaction_emergency_proactive_enabled=False,
             compaction_keep_recent_turns=1,
         ),
-        tools=[ScriptedTool(tool_name="Note")],
+        tools=[ScriptedTool(tool_name="Note", content="x" * 1_100)],
     )
-    run.llm.queue_tool_call_response(
-        tool_call_id="call-1",
-        tool_name="Note",
-        tool_input={},
-        usage_input_tokens=900,
-    )
+    # The first result is the one outside the protected batch, so the pass
+    # has something to work on and is opened.
+    for call_id in ("call-1", "call-2"):
+        run.llm.queue_tool_call_response(
+            tool_call_id=call_id,
+            tool_name="Note",
+            tool_input={},
+        )
     run.llm.queue_response(text="after the ordinary compaction")
 
     produced = await run.run("small question")
@@ -313,7 +324,11 @@ async def test_pressure_the_first_pass_cannot_absorb_is_summarised(
     apart from the first.
     """
     run = scenario(
-        rc=_compacting_rc(compaction_routine_min_clear_ratio=1.0),
+        rc=_compacting_rc(
+            model_context_window=4_096,
+            compaction_trigger_ratio=0.3,
+            compaction_routine_min_clear_ratio=1.0,
+        ),
     )
     for index in range(2):
         run.engine.history.append(

@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import (
+    LLMContextWindowExceeded,
     LLMProviderError,
     LLMRequest,
     LLMResponse,
@@ -46,6 +47,10 @@ from protocore.contracts.types import (
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
+from protocore.runtime.query import (
+    _await_transient_retry_backoff,
+    _transient_retry_permitted,
+)
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
 from protocore.runtime.tool_registry import ToolRegistry
 from protocore.tests_support.adapters import (
@@ -196,26 +201,18 @@ class _ScriptedLLM:
 
 
 class _FailingLLM:
-    """Raises ``exc`` on the ``fail_on``-th call, and behaves like ``fallback`` on every other.
+    """Raises ``exc`` on the first call, then behaves like ``fallback``."""
 
-    ``fail_on`` exists because when the failure lands decides what the run has
-    to lose: a failure on the first call catches a run that has produced
-    nothing, a later one a run that has already done work worth reporting.
-    """
-
-    def __init__(
-        self, exc: BaseException, fallback: _ScriptedLLM, *, fail_on: int = 1
-    ) -> None:
+    def __init__(self, exc: BaseException, fallback: _ScriptedLLM) -> None:
         self._exc = exc
         self._fallback = fallback
-        self._fail_on = fail_on
         self.calls: list[LLMRequest] = []
 
     async def stream_with_tools(  # type: ignore[no-untyped-def]
         self, request: LLMRequest
     ) -> AsyncIterator[LLMStreamEvent]:
         self.calls.append(request)
-        if len(self.calls) == self._fail_on:
+        if len(self.calls) == 1:
             if False:  # pragma: no cover — generator protocol marker
                 yield LLMStreamEvent(name="never", payload={})
             raise self._exc
@@ -229,8 +226,87 @@ class _FailingLLM:
         return self._fallback.count_tokens(text, model)
 
 
+class _FailsOnLLM:
+    """Plays the scripted turns, failing with ``exc`` on the named calls.
+
+    The wind-down question a provider failure asks is whether the run has
+    anything to report, so the failure has to be arrangeable AFTER some work as
+    well as before any — which :class:`_FailingLLM`, fixed at the first call,
+    cannot express. ``fail_on`` holds 1-based call numbers; the scripted turn
+    counter is not advanced by a call that failed, so the script describes the
+    turns that actually happen.
+    """
+
+    def __init__(
+        self, turns: list[dict[str, Any]], exc: BaseException, *, fail_on: set[int]
+    ) -> None:
+        self._scripted = _ScriptedLLM(turns)
+        self._exc = exc
+        self._fail_on = fail_on
+        self.calls: list[LLMRequest] = []
+
+    async def stream_with_tools(  # type: ignore[no-untyped-def]
+        self, request: LLMRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        self.calls.append(request)
+        if len(self.calls) in self._fail_on:
+            if False:  # pragma: no cover — generator protocol marker
+                yield LLMStreamEvent(name="never", payload={})
+            raise self._exc
+        async for evt in self._scripted.stream_with_tools(request):
+            yield evt
+
+    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        raise self._exc
+
+    def count_tokens(self, text, model=None) -> int:  # type: ignore[no-untyped-def]
+        return self._scripted.count_tokens(text, model)
+
+
+class _AlwaysFailsLLM:
+    """Fails with ``exc`` on every call, so a run gets nowhere at all."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.calls: list[LLMRequest] = []
+
+    async def stream_with_tools(  # type: ignore[no-untyped-def]
+        self, request: LLMRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        self.calls.append(request)
+        if False:  # pragma: no cover — generator protocol marker
+            yield LLMStreamEvent(name="never", payload={})
+        raise self._exc
+
+    async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+        raise self._exc
+
+    def count_tokens(self, text, model=None) -> int:  # type: ignore[no-untyped-def]
+        return max(1, len(text) // 4)
+
+
 def _user(text: str = "do the work") -> Message:
     return Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)])
+
+
+def _wind_down_causes(events: list[TurnEvent]) -> set[str]:
+    return {
+        str(e.payload.get("soft_stop_cause"))
+        for e in events
+        if e.type is EventType.STATE_CHANGED
+        and e.payload.get("reason") == "soft_stop_notified"
+    }
+
+
+def _retry_events(events: list[TurnEvent]) -> int:
+    return len(
+        [
+            e
+            for e in events
+            if e.type is EventType.STATE_CHANGED
+            and e.payload.get("reason") == "transient_llm_error_retry"
+        ]
+    )
 
 
 def _reasons(events: list[TurnEvent]) -> list[str]:
@@ -336,48 +412,22 @@ async def test_a_wind_down_that_produced_no_answer_does_not_complete() -> None:
 
 @pytest.mark.asyncio
 async def test_the_notification_lands_in_history_as_the_runtimes_own_words() -> None:
-    """Marked synthetic, so it cannot be mistaken for the model answering — and gone once the run is over."""
+    """Marked synthetic, so it cannot be mistaken for the model answering."""
     rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "done"}])
-    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
-    seen: list[list[Message]] = []
-
-    async for _ in engine.run(_user()):
-        seen.append(list(engine.history))
-
-    def notices(history: list[Message]) -> list[Message]:
-        return [
-            m
-            for m in history
-            if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-            == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
-        ]
-
-    during = [n for h in seen for n in notices(h)]
-    assert during and all(n.role is MessageRole.user for n in during)
-    assert notices(engine.history) == []  # the run is over; the next one starts with its tools
-
-
-@pytest.mark.asyncio
-async def test_a_failed_wind_down_does_not_leave_its_notice_behind() -> None:
-    """The notice told the model its tools were gone. A later run on the same history has them
-    back, and must not read an instruction to give up that was written for the run that failed."""
-    rc = LoopConstants(
-        model_context_window=4_096,
-        leader_tool_call_soft_cap=1,
-        soft_stop_max_turns=1,
-    )
-    llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
     async for _ in engine.run(_user()):
         pass
 
-    assert engine.state is LoopState.FAILED
-    assert not any(
-        m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY) == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+    notices = [
+        m
         for m in engine.history
-    )
+        if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+    ]
+    assert len(notices) == 1
+    assert notices[0].role is MessageRole.user
 
 
 @pytest.mark.asyncio
@@ -392,16 +442,20 @@ async def test_the_notification_is_bilingual_and_names_the_bound_that_was_hit() 
     async for _ in engine.run(_user()):
         pass
 
-    # The notice is gone from the finished run's history; the model read it in its last request.
     notice = next(
         m
-        for m in llm.calls[-1].messages
+        for m in engine.history
         if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
         == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
     )
     text = "".join(b.text for b in notice.content_blocks)
     assert "Write your final response" in text
     assert "Напишите финальный ответ" in text
+    # The reply presents results; it is not a log of the run's steps.
+    assert "your best answer" in text
+    assert "do not describe your steps" in text
+    assert "не описывайте шаги" in text
+    assert "what you did" not in text
     assert _soft_stop.CAUSE_TOOL_CALL_BUDGET in text
     assert "{cause}" not in text
 
@@ -630,8 +684,14 @@ async def test_the_wall_clock_deadline_takes_the_wind_down() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_provider_failure_is_retried_before_anything_else() -> None:
-    """One failed stream and a good one after it is a run that answers normally."""
+async def test_a_transient_provider_failure_is_retried_before_anything_else() -> None:
+    """One failed stream and a good one after it is a run that answers normally.
+
+    The bounded in-place retry outranks the wind-down for every failure the
+    adapter calls transient: winding down spends the same time on a narrowed
+    turn that answers from nothing, while the retry may get the run its real
+    answer.
+    """
     rc = LoopConstants(
         model_context_window=4_096, llm_transient_error_retry_backoff_base_seconds=0.0
     )
@@ -641,20 +701,266 @@ async def test_a_provider_failure_is_retried_before_anything_else() -> None:
 
     events = [evt async for evt in engine.run(_user())]
 
-    retries = [
-        e
-        for e in events
-        if e.type is EventType.STATE_CHANGED
-        and e.payload.get("reason") == "transient_llm_error_retry"
-    ]
-    assert len(retries) == 1
-    assert not [
-        e
-        for e in events
-        if e.type is EventType.STATE_CHANGED
-        and e.payload.get("reason") == "soft_stop_notified"
-    ]
+    assert _retry_events(events) == 1
+    assert not _wind_down_causes(events)
     assert engine.state is LoopState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_the_retries_are_bounded_and_the_bound_is_the_constant() -> None:
+    """A provider that never comes back costs the configured attempts, not more."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=3,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    llm = _AlwaysFailsLLM(LLMProviderError("provider down"))
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert _retry_events(events) == 3
+    assert len(llm.calls) == 4  # the first attempt, then the three retries
+    assert engine.state is LoopState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_failure_the_adapter_calls_permanent_is_not_retried() -> None:
+    """A bad key or a model that does not exist fails on the answer it got.
+
+    The adapter is the only party that saw the response, so the verdict is
+    read off the exception rather than guessed from its type here.
+    """
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    llm = _AlwaysFailsLLM(LLMProviderError("no such model", retryable=False))
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert _retry_events(events) == 0
+    assert len(llm.calls) == 1
+    assert engine.state is LoopState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_started_is_not_asked_to_write_a_report() -> None:
+    """A provider that refused every request ends as an error, not as an answer.
+
+    The wind-down asks the model for the best answer its evidence supports.
+    Put to a run with no prose, no tool call and no tool result it produces an
+    invented one: the operator reads a polite summary of work that never
+    happened, and the provider failure leaves no trace in the reply at all.
+    """
+    rc = LoopConstants(
+        model_context_window=4_096,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    llm = _AlwaysFailsLLM(LLMProviderError("provider down"))
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert not _wind_down_causes(events)
+    assert not [
+        m
+        for m in engine.history
+        if m.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        == _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+    ]
+    errors = [e for e in events if e.type is EventType.ERROR]
+    assert errors and errors[-1].payload["kind"] == "llm_provider_error"
+    assert "provider down" in str(errors[-1].payload)
+    assert engine.state is LoopState.FAILED
+    assert _final_stop(events).payload["has_final_answer"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_wind_down_carries_the_upstreams_own_words() -> None:
+    """A host showing the operator why a run ended needs the provider's message.
+
+    Reconstructing it from a log is not showing it, so the state events that
+    announce the wind-down carry the error text the upstream produced.
+    """
+    rc = LoopConstants(
+        model_context_window=4_096,
+        llm_transient_error_retry_max_attempts=0,
+    )
+    llm = _FailsOnLLM(
+        [{"tool": "Read", "args": {"x": "a"}}, {"text": "what I found so far"}],
+        LLMProviderError("upstream 503"),
+        fail_on={2},
+    )
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    details = {
+        str(e.payload.get("soft_stop_detail"))
+        for e in events
+        if e.type is EventType.STATE_CHANGED and "soft_stop_detail" in e.payload
+    }
+    assert details == {"LLMProviderError: upstream 503"}
+
+
+def test_the_notice_names_the_cause_it_was_entered_for() -> None:
+    """A provider failure is not a budget, and the notice must not say it is.
+
+    One text for every bound told a run whose endpoint refused it that it had
+    reached its budget, and a model reads that literally: it infers it was
+    given turns, spent them, and owes a summary of what they bought.
+    """
+    engine = _build_engine(
+        rc=LoopConstants(model_context_window=4_096), llm=_ScriptedLLM([]), tools=[]
+    )
+
+    provider = _soft_stop.notification_text(
+        engine, cause_name=_soft_stop.CAUSE_PROVIDER_ERROR
+    )
+    assert "reached its budget" not in provider
+    assert "not a budget limit" in provider.lower()
+    assert "model endpoint failed" in provider
+
+    # The bounds that really are budgets keep the wording they had.
+    for cause in (
+        _soft_stop.CAUSE_TOOL_CALL_BUDGET,
+        _soft_stop.CAUSE_MAX_TURNS,
+        _soft_stop.CAUSE_OUTPUT_TOKEN_BUDGET,
+    ):
+        assert "reached its budget" in _soft_stop.notification_text(
+            engine, cause_name=cause
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_context_overflow_is_never_retried_as_a_transient_failure() -> None:
+    """The request is the problem, so re-sending it unchanged fails identically.
+
+    An adapter cannot opt one into the transient ladder either: the overflow
+    type takes no ``retryable`` keyword, and the runtime answers it by
+    shrinking the request on a path taken before the flag would be read.
+    """
+    with pytest.raises(TypeError):
+        LLMContextWindowExceeded("too long", retryable=True)  # type: ignore[call-arg]
+    assert LLMContextWindowExceeded("too long").retryable is False
+
+    rc = LoopConstants(
+        model_context_window=4_096,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    llm = _AlwaysFailsLLM(LLMContextWindowExceeded("context window exceeded"))
+    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert _retry_events(events) == 0
+    assert not _wind_down_causes(events)
+
+
+def test_a_retry_is_refused_once_the_run_is_stopping() -> None:
+    """Cancelled, or out of wall clock: the attempt budget stops mattering.
+
+    A retry costs seconds of backoff and then a whole stream. Spending them
+    after the caller asked the run to stop, or past the point where the
+    deadline leaves room only to finalise, is work nobody is waiting for.
+    """
+    rc = LoopConstants(model_context_window=4_096, agent_max_seconds=60.0)
+    engine = _build_engine(rc=rc, llm=_ScriptedLLM([]), tools=[])
+    engine._run_started_monotonic = time.monotonic()
+    assert _transient_retry_permitted(engine) is True
+
+    engine.stop()
+    assert _transient_retry_permitted(engine) is False
+
+    fresh = _build_engine(rc=rc, llm=_ScriptedLLM([]), tools=[])
+    fresh._run_started_monotonic = time.monotonic() - 3_600.0
+    assert _transient_retry_permitted(fresh) is False
+
+
+@pytest.mark.asyncio
+async def test_a_classified_permanent_failure_is_not_retried_even_when_the_flag_is_unset() -> None:
+    """An adapter that attaches a verdict need not also touch the flag.
+
+    The class default says a provider error may be transient; a classification
+    naming a bad key or a missing model says it is not, and the classification
+    was made by the party that saw the response.
+    """
+
+    class _Classified:
+        def __init__(self, reason: str) -> None:
+            self.reason = reason
+
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_backoff_base_seconds=0.0,
+    )
+    exc = LLMProviderError("no such model")
+    exc.classified = _Classified("model_not_found")  # type: ignore[attr-defined]
+    llm = _AlwaysFailsLLM(exc)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+
+    events = [evt async for evt in engine.run(_user())]
+
+    assert _retry_events(events) == 0
+    assert len(llm.calls) == 1
+    assert engine.state is LoopState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_the_backoff_opens_no_further_request() -> None:
+    """A cancel that lands in the pause ends the run without one more stream."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        soft_stop_enabled=False,
+        llm_transient_error_retry_max_attempts=3,
+        llm_transient_error_retry_backoff_base_seconds=5.0,
+        llm_transient_error_retry_backoff_max_seconds=5.0,
+    )
+
+    class _StopsOnFirstFailure(_AlwaysFailsLLM):
+        def __init__(self, exc: Exception, engine_ref: list[QueryEngine]) -> None:
+            super().__init__(exc)
+            self._engine_ref = engine_ref
+
+        async def stream_with_tools(  # type: ignore[no-untyped-def]
+            self, request: LLMRequest
+        ) -> AsyncIterator[LLMStreamEvent]:
+            self.calls.append(request)
+            self._engine_ref[0].stop()
+            if False:  # pragma: no cover — generator protocol marker
+                yield LLMStreamEvent(name="never", payload={})
+            raise self._exc
+
+    holder: list[QueryEngine] = []
+    llm = _StopsOnFirstFailure(LLMProviderError("provider down"), holder)
+    engine = _build_engine(rc=rc, llm=llm, tools=[_FinalizeTool()])
+    holder.append(engine)
+
+    started = time.monotonic()
+    events = [evt async for evt in engine.run(_user())]
+
+    assert time.monotonic() - started < 3.0
+    assert len(llm.calls) == 1
+    assert engine.state is not LoopState.COMPLETED
+    assert _retry_events(events) <= 1
+
+
+@pytest.mark.asyncio
+async def test_a_backoff_ends_the_moment_the_run_is_told_to_stop() -> None:
+    """The pause is the one place a failing run holds still for whole seconds."""
+    rc = LoopConstants(model_context_window=4_096)
+    engine = _build_engine(rc=rc, llm=_ScriptedLLM([]), tools=[])
+    engine.stop()
+
+    started = time.monotonic()
+    await _await_transient_retry_backoff(engine, 30.0)
+
+    assert time.monotonic() - started < 1.0
 
 
 @pytest.mark.asyncio
@@ -662,16 +968,24 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     """The upstream stopped answering; the evidence gathered so far has not.
 
     Terminating here throws away a run that may already have everything it
-    needs to answer — which is what the incident this was written for did.
-    The retries come first; the wind-down is what follows when they are spent.
+    needs to answer — which is what the incident this was written for did. The
+    retries come first; the wind-down is what follows when they are spent. And
+    the failure lands AFTER a tool has run, because the evidence this is about
+    is what makes the wind-down legitimate: a run that produced nothing has a
+    different answer, pinned by
+    ``test_a_run_that_never_started_is_not_asked_to_write_a_report``.
     """
-    rc = LoopConstants(model_context_window=4_096, llm_transient_error_retry_max_attempts=0)
-    # A tool call first, so the run really has gathered something; the stream
-    # after it is the one the provider drops.
-    recovered = _ScriptedLLM(
-        [{"tool": "Read", "args": {}}, {"text": "Here is the answer despite the failure."}]
+    rc = LoopConstants(
+        model_context_window=4_096, llm_transient_error_retry_max_attempts=0
     )
-    llm = _FailingLLM(LLMProviderError("provider down"), recovered, fail_on=2)
+    llm = _FailsOnLLM(
+        [
+            {"tool": "Read", "args": {"x": "a"}},
+            {"text": "Here is the answer despite the failure."},
+        ],
+        LLMProviderError("provider down"),
+        fail_on={2},
+    )
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
     events = [evt async for evt in engine.run(_user())]
@@ -685,98 +999,12 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     assert causes == {_soft_stop.CAUSE_PROVIDER_ERROR}
     assert engine.state is LoopState.COMPLETED
     assert _final_stop(events).payload["has_final_answer"] is True
-    # The upstream's own words ride on the state change: the host shows the
-    # operator why the run closed, and an answer is not the only trace of it.
-    details = {
-        str(e.payload.get("soft_stop_detail") or "")
-        for e in events
-        if e.type is EventType.STATE_CHANGED
-        and e.payload.get("reason") == "soft_stop_notified"
-    }
-    assert details == {"LLMProviderError: provider down"}
-
-
-@pytest.mark.asyncio
-async def test_a_run_that_never_started_is_not_wound_down() -> None:
-    """Nothing was produced, so there is nothing to write a closing answer about.
-
-    A wind-down asks the model for the best answer its evidence supports. A run
-    whose first request never reached the model has no evidence, and asked to
-    close anyway it writes a summary of work it never did — the operator then
-    reads a polite report of nothing and never learns the provider failed. So
-    the failure itself is the outcome.
-    """
-    rc = LoopConstants(model_context_window=4_096, llm_transient_error_retry_max_attempts=0)
-    recovered = _ScriptedLLM([{"text": "An answer about nothing at all."}])
-    llm = _FailingLLM(LLMProviderError("grammar refused"), recovered)
-    engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
-
-    events = [evt async for evt in engine.run(_user())]
-
-    assert "soft_stop_notified" not in _reasons(events)
-    errors = [e for e in events if e.type is EventType.ERROR]
-    assert errors and errors[-1].payload["kind"] == "llm_provider_error"
-    assert "grammar refused" in str(errors[-1].payload.get("message") or "")
-    assert engine.state is LoopState.FAILED
-    assert engine.has_final_answer is False
-
-
-@pytest.mark.asyncio
-async def test_the_notice_names_the_cause_it_was_entered_for() -> None:
-    """A provider failure is not a budget, and the model is not told it is.
-
-    The one text for all five bounds said "the run has reached its budget" to a
-    run whose budget was untouched — the upstream had refused it. A model reads
-    that literally: it believes it was given turns, spent them, and owes a
-    summary of the work they bought.
-    """
-    rc = LoopConstants(model_context_window=4_096)
-    engine = _build_engine(rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()])
-
-    provider = _soft_stop.notification_text(
-        engine, cause_name=_soft_stop.CAUSE_PROVIDER_ERROR
-    )
-    deadline = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
-    budget = _soft_stop.notification_text(
-        engine, cause_name=_soft_stop.CAUSE_TOOL_CALL_BUDGET
-    )
-
-    assert "reached its budget" not in provider
-    assert "not a budget limit" in provider.lower()
-    assert "earlier requests may have consumed" in provider.lower()
-    stalled = _soft_stop.notification_text(engine, cause_name=_soft_stop.CAUSE_MODEL_NO_PROGRESS)
-    assert "model output failure" in stalled
-    assert "Requests consumed tokens and time" in stalled
-    assert "model endpoint failed" in provider
-    assert "time limit" in deadline
-    # The three bounds that really are budgets keep the wording they had.
-    assert budget == rc.soft_stop_notice_text.replace(
-        "{cause}", _soft_stop.CAUSE_TOOL_CALL_BUDGET
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_blank_cause_notice_falls_back_to_the_general_one() -> None:
-    rc = LoopConstants(model_context_window=4_096, soft_stop_notice_text_provider_error="")
-    engine = _build_engine(rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()])
-
-    text = _soft_stop.notification_text(
-        engine, cause_name=_soft_stop.CAUSE_PROVIDER_ERROR
-    )
-
-    assert text == rc.soft_stop_notice_text.replace(
-        "{cause}", _soft_stop.CAUSE_PROVIDER_ERROR
-    )
 
 
 @pytest.mark.asyncio
 async def test_a_provider_failure_the_wind_down_cannot_rescue_still_reports_it() -> None:
     """The original error is surfaced, not buried under a silent no-answer stop."""
-    rc = LoopConstants(
-        model_context_window=4_096,
-        soft_stop_max_turns=1,
-        llm_transient_error_retry_backoff_base_seconds=0.0,
-    )
+    rc = LoopConstants(model_context_window=4_096, soft_stop_max_turns=1)
 
     class _AlwaysFails:
         def __init__(self) -> None:

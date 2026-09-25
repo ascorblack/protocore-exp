@@ -30,6 +30,8 @@ from protocore.contracts.types import Message, MessageRole, StopReason, TextBloc
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
+from ._tool_fixtures import MockTool
+
 # ----------------------------------------------------------------------
 # LLM mocks
 # ----------------------------------------------------------------------
@@ -448,7 +450,7 @@ async def test_transient_retry_persists_partial_text(engine_factory, in_memory_r
 async def test_transient_exhaustion_preserves_delivered_answer(
     engine_factory, in_memory_runtime
 ) -> None:
-    """A transient error on a forced continuation after a delivered answer
+    """A transient error on the forced terminal call after a delivered answer
     completes on that answer instead of failing."""
     prose = "Here is the complete and substantive answer to your question."
     rc = _no_backoff_rc(
@@ -456,6 +458,11 @@ async def test_transient_exhaustion_preserves_delivered_answer(
         terminal_tool_nudge_enabled=True,
     )
     engine = engine_factory(rc=rc, expected_terminal_tool="final_answer")
+    # A terminal tool the run can call, or there is no call to force and the
+    # run completes on the answer without another request.
+    in_memory_runtime["tools"].register(
+        MockTool(tool_name="final_answer", description="Submit the answer")
+    )
     llm = _ProseThenAlwaysTransientLLM(
         exception=LLMRateLimitError("429 on the forced continuation"),
         prose=prose,

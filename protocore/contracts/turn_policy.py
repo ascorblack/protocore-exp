@@ -110,7 +110,7 @@ class TurnDirective(StrEnum):
 class ITurnState(Protocol):
     """The run, as a policy is allowed to see it.
 
-    Fifteen names. Reads are reads of the live run; the five callables that
+    Seventeen names. Reads are reads of the live run; the five callables that
     change something (:attr:`history` append, :meth:`transition_to`,
     :meth:`mark_pending_approval`, :meth:`release_interrupt`,
     :meth:`forget_tool_name`) and the durable :meth:`persist_snapshot` are the
@@ -123,6 +123,9 @@ class ITurnState(Protocol):
     state: LoopState
     #: Iterations the per-iteration compaction gate still stands down for, after a pass that freed nothing.
     compaction_backoff_left: int
+    #: The prompt's size when that backoff was set; growth past
+    #: ``compaction_no_gain_backoff_growth_ratio`` of it ends the backoff early.
+    compaction_backoff_prompt_tokens: int
 
     @property
     def rc(self) -> LoopConstants:

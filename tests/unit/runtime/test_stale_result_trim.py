@@ -74,11 +74,11 @@ def test_the_oldest_results_are_cut_and_the_newest_are_not() -> None:
         assert "stale_trimmed" not in results[call_id].metadata
 
 
-def test_the_pointer_says_how_much_went() -> None:
+def test_the_pointer_says_what_was_kept_and_what_went() -> None:
     view, _ = trim_stale_results(_transcript(4), _rc(), PROMPTS)
-    assert "[trimmed 800 chars: this result is older than the last 2 tool calls" in (
-        _results(view)["call_0"].content
-    )
+    content = _results(view)["call_0"].content
+    assert "[trimmed: 100 chars kept, 800 removed" in content
+    assert "NOT complete evidence" in content
 
 
 def test_persist_is_never_touched() -> None:
@@ -252,7 +252,7 @@ def test_a_trimmed_result_fits_the_split_that_runs_after_it() -> None:
     assert "call_0" in trimmed
     content = _results(view)["call_0"].content
     assert len(content) <= 500
-    assert content.endswith("call the tool again if you need it]")
+    assert content.endswith("call the tool again if you need the rest]")
 
 
 def test_the_switch_off_leaves_the_view_alone() -> None:
@@ -323,3 +323,89 @@ def test_a_pin_over_a_file_nothing_rewrote_survives_the_roles_being_declared() -
     )
     assert "kept" not in trimmed
     assert _results(view)["kept"].content == "x" * 900
+
+
+def _page(call_id: str, *, body: int, citation: str) -> list[Message]:
+    """A page-shaped result: a citation line, then a body far past the head."""
+    return [
+        *_pair(call_id, 0)[:1],
+        Message(
+            role=MessageRole.user,
+            content_blocks=[
+                ToolResultBlock(
+                    tool_call_id=call_id,
+                    content="\n".join([citation, "y" * body, citation]),
+                )
+            ],
+        )
+    ]
+
+
+def test_the_line_that_identifies_the_result_survives_the_body() -> None:
+    # The citation sits past the head, so a head-only cut loses it — and a
+    # citation the model cannot see is one it makes up.
+    citation = "Cite exactly: [[catalog:9912/p414]]"
+    history = [*_page("page", body=900, citation=citation), *_transcript(4)]
+    view, trimmed = trim_stale_results(history, _rc(), PROMPTS)
+    assert "page" in trimmed
+    content = _results(view)["page"].content
+    assert citation in content
+    assert content.index(citation) < content.index("[trimmed:")
+    assert "y" * 900 not in content
+
+
+def test_every_configured_prefix_is_carried_and_others_are_not() -> None:
+    body = "\n".join(
+        [
+            "Cite: Ross, Atlas of Mosses, 1961",
+            "Source: https://example.invalid/records/8",
+            "note: the middle of the page nobody needs twice",
+            "z" * 900,
+        ]
+    )
+    history = [
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[ToolUseBlock(tool_call_id="page", name="Read", arguments_json="{}")],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[ToolResultBlock(tool_call_id="page", content=body)],
+        ),
+        *_transcript(4),
+    ]
+    view, _ = trim_stale_results(history, _rc(tool_result_stale_max_chars=10), PROMPTS)
+    content = _results(view)["page"].content
+    assert "Cite: Ross, Atlas of Mosses, 1961" in content
+    assert "Source: https://example.invalid/records/8" in content
+    assert "note: the middle of the page" not in content
+
+
+def test_the_carry_over_can_be_turned_off() -> None:
+    citation = "Cite exactly: [[catalog:9912/p414]]"
+    history = [*_page("page", body=900, citation=citation), *_transcript(4)]
+    view, _ = trim_stale_results(
+        history,
+        _rc(tool_result_stale_max_chars=10, tool_result_stale_trim_protected_prefixes=""),
+        PROMPTS,
+    )
+    assert citation not in _results(view)["page"].content
+
+
+def test_a_carried_citation_still_fits_the_split_that_runs_after_it() -> None:
+    citation = "Cite exactly: [[catalog:9912/p414]]"
+    history = [*_page("page", body=4000, citation=citation), *_transcript(4, size=4000)]
+    view, trimmed = trim_stale_results(
+        history,
+        _rc(
+            tool_result_stale_max_chars=3000,
+            tool_result_split_enabled=True,
+            tool_result_content_max_chars=500,
+        ),
+        PROMPTS,
+    )
+    assert "page" in trimmed
+    content = _results(view)["page"].content
+    assert len(content) <= 500
+    assert citation in content
+    assert content.endswith("call the tool again if you need the rest]")

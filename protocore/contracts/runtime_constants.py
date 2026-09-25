@@ -53,6 +53,43 @@ class LoopConstants(BaseModel):
         le=1.0,
         description="Fraction of context window above which compaction is triggered.",
     )
+    provider_reserves_output_in_context_window: bool = Field(
+        default=True,
+        description=(
+            "Whether the serving stack counts the requested output budget "
+            "against the same context window as the prompt. Self-hosted "
+            "inference servers commonly do: they refuse any request whose "
+            "prompt plus max output exceeds the window, so the largest prompt "
+            "that is accepted is the window less the output reserve, and the "
+            "compaction trigger has to sit below THAT rather than below the "
+            "window. Hosted APIs commonly size the input window independently "
+            "of the requested output, and there the deduction only gives away "
+            "usable window. True by default because the deduction is safe "
+            "everywhere — it compacts earlier than strictly necessary — while "
+            "its absence is a run that cannot recover on a server that does "
+            "reserve. Set False on a provider that does not, to get the whole "
+            "window back."
+        ),
+    )
+    compaction_trigger_turn_headroom_ratio: float = Field(
+        default=0.15,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of the context window kept free above the compaction "
+            "trigger so that ONE more turn fits before the request stops being "
+            "accepted. A server that reserves the output budget inside the "
+            "window rejects any prompt above window - max output, so the "
+            "trigger has to sit below that cliff rather than merely below the "
+            "window; and it has to sit a whole turn below it, because the "
+            "check runs BEFORE a turn whose tool results can add tens of "
+            "thousands of tokens and because the character-based estimate runs "
+            "short of the provider's own count. A sixth of the window is what "
+            "a large tool turn plus that undercount measured at, and it is the "
+            "figure a 65k window running a non-Latin script needs to keep "
+            "proactive compaction reachable at all."
+        ),
+    )
     compaction_routine_min_clear_ratio: float = Field(
         default=0.5,
         gt=0.0,
@@ -85,6 +122,34 @@ class LoopConstants(BaseModel):
             "freed less than compaction_min_gain_ratio. 0 disables the backoff."
         ),
     )
+    compaction_no_gain_backoff_growth_ratio: float = Field(
+        default=0.1,
+        gt=0.0,
+        description=(
+            "The no-gain backoff ends early once the prompt has grown by this "
+            "fraction of its size when the backoff was set: the new content may "
+            "be exactly what the pass can shed. A context refusal ends it too."
+        ),
+    )
+    compaction_proactive_suspension_iterations: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "After a proactive compaction pass exhausts compaction_failed_max_retries, "
+            "the proactive gates skip their summariser tiers for this many gate "
+            "visits; the no-LLM truncation tier keeps running. A provider or local "
+            "context refusal lifts the suspension at once."
+        ),
+    )
+    compaction_proactive_suspension_growth_ratio: float = Field(
+        default=0.1,
+        gt=0.0,
+        description=(
+            "A suspension of proactive compaction also ends once the prompt has "
+            "grown by this fraction of its size when the suspension began: the "
+            "history the summariser failed on is no longer the one in front of it."
+        ),
+    )
     token_estimate_calibration: float = Field(
         default=1.0,
         ge=1.0,
@@ -95,7 +160,11 @@ class LoopConstants(BaseModel):
             "text, by a factor that depends on the content; when a provider reports "
             "the true size of a prompt, the loop sets this so that the tiers size "
             "units, budgets and gains in the provider's tokens rather than in an "
-            "undercount that leaves them nothing to shrink. 1.0 = uncalibrated."
+            "undercount that leaves them nothing to shrink. 1.0 = uncalibrated. "
+            "What a run learns is kept in its snapshot and restored on resume for "
+            "the same model, but a new run starts from this value: a host that "
+            "knows its model and content runs above the heuristic sets it per "
+            "scope, and every new run starts from that instead of from 1.0."
         ),
     )
     token_estimate_calibration_enabled: bool = Field(
@@ -103,6 +172,63 @@ class LoopConstants(BaseModel):
         description=(
             "Whether the loop updates token_estimate_calibration from the prompt "
             "sizes providers report. Off, the estimate stays at its configured factor."
+        ),
+    )
+    exact_token_count_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the loop asks a provider that can count a rendered request "
+            "for that count when the estimate is close to a limit. Only providers "
+            "that implement the counting capability are asked; for every other "
+            "provider this setting changes nothing."
+        ),
+    )
+    exact_token_count_margin_ratio: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How close to a limit the estimate has to be before the provider is "
+            "asked for an exact count, as a share of that limit: the count is "
+            "requested once the estimate reaches limit * (1 - ratio). The limits "
+            "are the prompt size at which the output cap starts being clipped and "
+            "the compaction trigger. A prompt the estimate undercounts by a factor "
+            "f is only caught when ratio >= 1 - 1/f. Measured against a vLLM "
+            "tokenizer (Qwen 3.6), the heuristic undercounts JSON by 1.76x and "
+            "hexadecimal text by 3.53x, which needs 0.72; 0.75 is 1 - 1/4, the "
+            "largest undercount token_estimate_calibration can express. 0 asks "
+            "only once the estimate itself is over the limit."
+        ),
+    )
+    exact_token_count_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=(
+            "How long the loop waits for a provider's exact count before it "
+            "sizes the request by its estimate instead. The count is asked before "
+            "the stream opens, outside the stream's idle watchdog, so an endpoint "
+            "that does not answer would otherwise hold the turn. It is the "
+            "ceiling for any timeout the provider applies to its own count: a "
+            "provider bound set higher than this never gets to fire."
+        ),
+    )
+    exact_token_count_failure_backoff_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        description=(
+            "How long a run stops asking for exact counts after one failed or "
+            "timed out. A counting route that hangs would otherwise cost "
+            "exact_token_count_timeout_seconds on every iteration near the "
+            "edge; while backing off, requests are sized by the estimate. "
+            "0 retries on the next request."
+        ),
+    )
+    exact_token_count_cache_max_entries: int = Field(
+        default=32,
+        gt=0,
+        description=(
+            "Exact counts a run keeps, keyed by the content of the request they "
+            "measured, so a request re-sized on a retry is not counted twice."
         ),
     )
     compaction_per_iteration_enabled: bool = Field(
@@ -345,6 +471,16 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Last-N turns kept verbatim across compaction.",
     )
+    compaction_force_keep_recent_turns: int = Field(
+        default=1,
+        gt=0,
+        description=(
+            "Last-N messages kept verbatim when compaction answers a provider "
+            "context-window rejection. Smaller than the routine keep window "
+            "because the provider has already proven the request does not fit; "
+            "the trailing message is the request being recovered."
+        ),
+    )
     compaction_tracked_tool_names: tuple[str, ...] = Field(
         default=("Write", "Edit", "Read", "Glob", "Grep"),
         description=(
@@ -359,7 +495,14 @@ class LoopConstants(BaseModel):
     compaction_failed_max_retries: int = Field(
         default=2,
         ge=0,
-        description="Max compaction retries before run transitions to FAILED.",
+        description=(
+            "Consecutive failed compaction passes allowed before compaction "
+            "gives up, counted apart for proactive and reactive passes. A pass "
+            "with nothing eligible is not a failure. Past the bound a proactive "
+            "pass suspends proactive compaction until the provider rejects a "
+            "request; a reactive pass hands the turn to the output-cap ladder, "
+            "or fails the run when no smaller cap is left."
+        ),
     )
     compaction_shed_reasoning_enabled: bool = Field(
         default=True,
@@ -435,23 +578,50 @@ class LoopConstants(BaseModel):
         default=4,
         ge=1,
         description=(
-            "Tokens one word of a summary is assumed to cost on the way OUT, "
-            "used to cap the word budget the summariser is asked for at what "
-            "compaction_summary_max_output_tokens can hold. Two was the English "
-            "figure; JSON escaping and a non-Latin script (Cyrillic runs at three "
-            "or four tokens a word) put a budget sized that way past the cap on "
-            "every large unit, and a summary the cap cuts is never parsed."
+            "Tokens one word of a summary is assumed to cost on the way OUT. "
+            "The word budget the summariser is asked for is capped at what "
+            "compaction_summary_max_output_tokens can hold at this rate. Two "
+            "is the figure for English prose; JSON escaping and a non-Latin "
+            "script (Cyrillic runs at three to four tokens a word) put a "
+            "budget sized that way past the output cap on every large unit, "
+            "and a summary the cap cuts off is never valid JSON, never parsed "
+            "and never committed — so the largest units are exactly the ones "
+            "that never shrink, and the next pass pays for them again."
+        ),
+    )
+    compaction_summary_envelope_tokens: int = Field(
+        default=32,
+        ge=0,
+        description=(
+            "Tokens of the summariser's output cap reserved for the JSON "
+            "around the words — the opening brace, the key, the quotes and "
+            "whatever escaping the text forces. Subtracted from the cap before "
+            "the word budget is derived, so a summary that spends its whole "
+            "stated budget still closes its envelope instead of being cut one "
+            "token short of valid JSON and discarded."
+        ),
+    )
+    compaction_summary_chars_per_word: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "Characters one word of a summary is assumed to cost, used to "
+            "restate the summariser's word budget in the prompt as a character "
+            "budget as well. A model holds to a length it can count directly "
+            "better than to a word count it has to estimate, and the budget "
+            "only bites when the reply would otherwise have been cut off."
         ),
     )
     compaction_summary_failed_unit_max_attempts: int = Field(
         default=2,
         ge=1,
         description=(
-            "How many passes may try to summarise the same unit and fail (the "
-            "provider raised, the reply was cut or carried no summary) before "
-            "the run stops paying for that unit. A unit that fails the same way "
-            "twice fails the same way on every later pass, and the per-iteration "
-            "gate would otherwise buy the same failure each iteration."
+            "How many passes may try to summarise the same unit and fail — the "
+            "provider raised, the request would not fit, or the reply carried "
+            "no usable summary — before the run stops paying for that unit. A "
+            "unit that fails the same way twice fails the same way every later "
+            "pass, and the per-iteration gate would otherwise buy the same "
+            "failure once an iteration. The fold tier still gets its turn at it."
         ),
     )
     compaction_summary_tokens_per_word: int = Field(
@@ -709,17 +879,18 @@ class LoopConstants(BaseModel):
             "finalizing one has been removed from your surface, so no further "
             "work is possible. Write your final response to the user now, as an "
             "ordinary assistant message in plain prose, in the language of the "
-            "conversation: what you did, what you found, and where the results "
-            "are. State plainly what is unfinished rather than implying the task "
-            "is complete. Then call the terminal tool to end the run. "
+            "conversation: your best answer from what you already have, and "
+            "where results are. Say plainly what you could not establish or "
+            "finish; do not describe your steps. Then call the terminal tool to "
+            "end the run. "
             "[внутреннее управление — не часть ответа] Выполнение достигло "
             "предела ({cause}) и сейчас завершается. Все инструменты, кроме "
             "завершающего, убраны из вашей поверхности, продолжать работу "
             "нельзя. Напишите финальный ответ пользователю сейчас — обычным "
-            "сообщением ассистента, простым текстом, на языке диалога: что вы "
-            "сделали, что выяснили и где лежат результаты. Прямо укажите, что "
-            "осталось незавершённым, а не создавайте впечатление выполненной "
-            "задачи. Затем вызовите терминальный инструмент, чтобы завершить "
+            "сообщением ассистента, простым текстом, на языке диалога: лучший "
+            "ответ из уже собранного и где лежат результаты. Прямо укажите, "
+            "что выяснить или доделать не удалось; не описывайте шаги. "
+            "Затем вызовите терминальный инструмент, чтобы завершить "
             "выполнение."
         ),
         description=(
@@ -736,46 +907,27 @@ class LoopConstants(BaseModel):
             "Per-tenant overridable."
         ),
     )
-    soft_stop_notice_text_model_no_progress: str = Field(
-        default=(
-            "[internal control — not part of the reply] The model returned reasoning "
-            "repeatedly without an answer or a tool call. Recovery attempts are exhausted. "
-            "This is a model output failure, not evidence of an unreachable endpoint. "
-            "Requests consumed tokens and time. Do not claim that no budget was spent "
-            "or that no work happened. Briefly report only verified results from this run, "
-            "name what remains incomplete, and explain that the model stopped making "
-            "progress. Use the language of the conversation, then call the terminal tool. "
-            "[внутреннее управление — не часть ответа] Модель повторно вернула "
-            "рассуждения без ответа и вызова инструмента. Попытки восстановления "
-            "исчерпаны. Это сбой вывода модели, а не доказательство недоступности "
-            "сервера. Запросы расходовали токены и время. Кратко сообщите только "
-            "проверенные результаты, что не завершено и что модель перестала "
-            "продвигаться. Ответьте на языке диалога и вызовите завершающий инструмент."
-        ),
-        description="Wind-down notice for repeated reasoning without consumable output.",
-    )
     soft_stop_notice_text_provider_error: str = Field(
         default=(
             "[internal control — not part of the reply] This run is closing "
             "because the model endpoint failed: the requests it was sent were "
             "refused or came back with nothing usable, and the retries are "
-            "spent. This is not a budget limit; earlier requests may have consumed "
-            "tokens and time. Do not claim otherwise. Do not say the "
-            "run ran out of anything, and do not present this as a limit you "
-            "hit. The operator has already been shown the provider's own "
-            "error, so your reply is not the only trace of it. Write one short "
-            "final message, as an ordinary assistant message in plain prose, "
-            "in the language of the conversation: say plainly that the model "
-            "provider failed and the task could not be completed. "
-            "Report only work that actually happened in this run; if none "
-            "happened, say exactly that rather than summarising anything. Then "
-            "call the terminal tool to end the run. "
+            "spent. This is not a budget limit; earlier requests may have "
+            "consumed tokens and time. Do not claim otherwise, and do not "
+            "present this as a limit you hit. The operator has already been "
+            "shown the provider's own error, so your reply is not the only "
+            "trace of it. Write one short final message, as an ordinary "
+            "assistant message in plain prose, in the language of the "
+            "conversation: say plainly that the model provider failed and the "
+            "task could not be completed. Report only work that actually "
+            "happened in this run; if none happened, say exactly that rather "
+            "than summarising anything. Then call the terminal tool to end the "
+            "run. "
             "[внутреннее управление — не часть ответа] Выполнение завершается "
             "из-за сбоя эндпоинта модели: запросы к нему были отклонены или "
-            "вернули непригодный ответ, попытки повтора исчерпаны. Никакой "
-            "предел бюджета НЕ достигнут, но предыдущие запросы могли расходовать "
-            "токены и время — не утверждайте обратное и не пишите, что "
-            "что-то закончилось, и не выдавайте это за достигнутое "
+            "вернули непригодный ответ, попытки повтора исчерпаны. Это не "
+            "предел бюджета, но предыдущие запросы могли расходовать токены и "
+            "время — не утверждайте обратное и не выдавайте это за достигнутое "
             "ограничение. Пользователю уже показана собственная ошибка "
             "провайдера, ваш ответ — не единственный её след. Напишите одно "
             "короткое финальное сообщение обычным текстом, на языке диалога: "
@@ -786,47 +938,14 @@ class LoopConstants(BaseModel):
             "терминальный инструмент, чтобы завершить выполнение."
         ),
         description=(
-            "The wind-down notice used when the cause is ``provider_error`` — "
-            "the upstream refused the run's requests or returned nothing "
-            "usable. It exists because the general notice says the run reached "
-            "its BUDGET, and a model told that after a provider outage writes a "
-            "closing summary of work it never did: it believes it spent turns "
-            "it was never given. The cause is the one thing the notice has to "
-            "get right, so the causes that are not budgets carry their own "
-            "text. Empty string falls back to ``soft_stop_notice_text``. "
-            "Per-tenant overridable."
-        ),
-    )
-    soft_stop_notice_text_deadline: str = Field(
-        default=(
-            "[internal control — not part of the reply] The run has reached its "
-            "wall-clock time limit and is now closing. Not a token or tool "
-            "budget: the time allowed for this run is up. Every tool except "
-            "the finalizing one has been removed from your surface, so no "
-            "further work is possible. Write your final response to the user "
-            "now, as an ordinary assistant message in plain prose, in the "
-            "language of the conversation: what you did, what you found, and "
-            "where the results are. State plainly what is unfinished rather "
-            "than implying the task is complete. Then call the terminal tool to "
-            "end the run. "
-            "[внутреннее управление — не часть ответа] Выполнение достигло "
-            "предела по времени и сейчас завершается. Это не предел по токенам "
-            "или вызовам инструментов: закончилось отведённое на выполнение "
-            "время. Все инструменты, кроме завершающего, убраны из вашей "
-            "поверхности, продолжать работу нельзя. Напишите финальный ответ "
-            "пользователю сейчас — обычным сообщением ассистента, простым "
-            "текстом, на языке диалога: что вы сделали, что выяснили и где "
-            "лежат результаты. Прямо укажите, что осталось незавершённым, а не "
-            "создавайте впечатление выполненной задачи. Затем вызовите "
-            "терминальный инструмент, чтобы завершить выполнение."
-        ),
-        description=(
-            "The wind-down notice used when the cause is ``deadline``. Same "
-            "shape as ``soft_stop_notice_text`` — the run really did run out of "
-            "something and has work to report — but it names the wall clock "
-            "rather than a budget, because a model told it spent a budget "
-            "reports on the wrong bound. Empty string falls back to "
-            "``soft_stop_notice_text``. Per-tenant overridable."
+            "The wind-down notice used when the cause is ``provider_error``. It "
+            "exists because the general notice says the run reached its BUDGET, "
+            "and a model told that after an upstream failure writes a closing "
+            "summary of work it never did: it believes it spent turns it was "
+            "never given. The cause is the one thing the notice has to get "
+            "right, so the cause that is not a budget carries its own text. "
+            "Empty string falls back to ``soft_stop_notice_text``. Per-tenant "
+            "overridable."
         ),
     )
     run_tool_call_ledger_max_entries: int = Field(
@@ -959,6 +1078,26 @@ class LoopConstants(BaseModel):
             "Fraction of ``max_context`` used as ``LLMRequest.max_tokens`` "
             "for assistant-stream calls (default 0.25 — i.e. quarter of "
             "the window reserved for output)."
+        ),
+    )
+    context_overflow_retry_output_ratio: float = Field(
+        default=0.5,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Fraction of the rejected assistant output cap used for each bounded "
+            "corrective retry after a context-window rejection. An exact provider "
+            "prompt measurement may permit one retry before compaction; otherwise "
+            "recovery compacts history first and then repeatedly lowers the cap."
+        ),
+    )
+    context_overflow_retry_max_attempts: int = Field(
+        default=13,
+        ge=1,
+        description=(
+            "Maximum number of strictly smaller assistant output caps attempted "
+            "for one message after context-window rejections. The default permits "
+            "halving an 8192-token cap down through the one-token floor."
         ),
     )
     pinned_tool_max_count: int = Field(
@@ -1511,11 +1650,10 @@ class LoopConstants(BaseModel):
         default=2,
         ge=0,
         description=(
-            "Bounded in-place retries for an upstream LLM failure raised on the "
-            "assistant stream: a 429 rate-limit (``LLMRateLimitError``), a "
-            "request/stream timeout (``LLMTimeoutError``), a stream that went "
-            "idle (``LLMStreamIdleError``) or the adapters' catch-all "
-            "(``LLMProviderError``). The loop first "
+            "Bounded in-place retries for a TRANSIENT upstream LLM failure — a "
+            "429 rate-limit (``LLMRateLimitError``) or a request/stream timeout "
+            "(``LLMTimeoutError``) — raised on the assistant stream. These "
+            "classes are retryable per the error classifier, so the loop first "
             "steps down the run's model priority list (when one is configured "
             "and the advance budget is not spent), and otherwise re-opens the "
             "SAME stream up to this many times with a backoff between attempts "
@@ -1627,17 +1765,9 @@ class LoopConstants(BaseModel):
         default=2,
         ge=0,
         description=(
-            "Retries after a round the output cap cut while the model was "
-            "still reasoning (``finish_reason='length'``, reasoning and nothing "
-            "else). The cut reasoning is not kept and nothing is appended for "
-            "it: each retry sends the same prompt with one knob changed — the "
-            "first lowers the reasoning effort to ``low`` and adds the one nudge "
-            "in ``reasoning_length_cut_nudge_text``, the second switches "
-            "thinking off (``reasoning_length_cut_disable_thinking``). A retry "
-            "that would change nothing is skipped, and past the count the run "
-            "winds down. The knobs go back to their configured values on the "
-            "next round that produces anything. ``0`` disables the retries: the "
-            "first cut winds the run down."
+            "Maximum recovery retries when a length-limited response contains "
+            "reasoning but no visible text or tool call. Recovery first lowers "
+            "reasoning effort and then disables thinking when permitted."
         ),
     )
     reasoning_length_cut_nudge_text: str = Field(
@@ -1648,18 +1778,15 @@ class LoopConstants(BaseModel):
             "answer or exactly one tool call."
         ),
         description=(
-            "The one synthetic user message sent with the first retry after a "
-            "reasoning-only length cut. It names the mechanical cause and asks "
-            "for a shorter shape; it never asks the model to resume reasoning "
-            "that was not kept."
+            "Synthetic user-role instruction appended on the first "
+            "reasoning-only length-cut recovery attempt."
         ),
     )
     reasoning_length_cut_disable_thinking: bool = Field(
         default=True,
         description=(
-            "Whether the last retry after a reasoning-only length cut switches "
-            "thinking off for that round. Off, the ladder stops at lowered "
-            "effort; a run mode that requires thinking skips the step either way."
+            "Allow reasoning-only length-cut recovery to disable thinking "
+            "after lowering reasoning effort. Deep mode remains unchanged."
         ),
     )
 
@@ -1766,12 +1893,15 @@ class LoopConstants(BaseModel):
         default=False,
         description=(
             "When True AND ``QueryEngineConfig.expected_terminal_tool`` is "
-            "non-empty AND no successful terminal tool result is in "
-            "history, the query loop injects one additional user message "
-            "reminding the model to call the configured terminal tool. "
-            "This is a contract-repair guard, not scorer automation: the "
-            "model still chooses the tool arguments. The message body comes "
-            "from the ``terminal_tool_nudge`` prompt template."
+            "non-empty, a run that ends a turn without a successful terminal "
+            "tool result is made to call it. A turn that ended with a "
+            "substantive answer is followed by forced requests (see "
+            "``terminal_tool_forced_max_attempts``) that append nothing to "
+            "the transcript. A turn that ended with no answer gets one "
+            "additional user message from the ``terminal_tool_nudge`` prompt "
+            "template asking for the answer and the call, and the answer it "
+            "then writes is forced. The model still chooses the tool "
+            "arguments."
         ),
     )
     preserve_completed_answer_on_stream_error: bool = Field(
@@ -1829,15 +1959,14 @@ class LoopConstants(BaseModel):
             "successful file-write tool result "
             "(``terminal_tool_nudge_file_write_tool_names``) is in history, "
             "the nudge text is prefixed with the "
-            "``terminal_tool_nudge_write_first`` prompt template so the model is steered "
-            "to call the ACTUAL deliverable write tool (Write/AppendFile) "
-            "FIRST, not just the terminal tool. This closes the "
-            "narrate-then-surrender failure where a model says 'Now let me "
-            "write this file' and fires 0 tools. Bounded by the single-shot "
-            "nudge latch (never loops). Default True is universal — a strong "
-            "model that already wrote the file never sees the prefix (the "
-            "history check finds its write result). Set False to restore the "
-            "plain terminal nudge."
+            "``terminal_tool_nudge_write_first`` prompt template so the model "
+            "is steered to call the actual deliverable write tool first, not "
+            "just the terminal tool. The nudge fires only for a turn that "
+            "ended with no answer; a turn that ended with prose is sealed by "
+            "a forced terminal call instead, so prose that merely announces a "
+            "file ('Now let me write this file') is not steered by this "
+            "prefix unless ``terminal_tool_nudge_write_first_before_forcing`` "
+            "is on. Bounded by the single-shot nudge latch (never loops)."
         ),
     )
     terminal_tool_nudge_file_write_tool_names: tuple[str, ...] = Field(
@@ -1850,6 +1979,58 @@ class LoopConstants(BaseModel):
             "prefix is added. Configurable so a tenant with differently "
             "named write tools stays universal — no the host tool name is "
             "hardcoded in core."
+        ),
+    )
+    terminal_tool_forced_max_attempts: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Budget for forcing the terminal call once a run's answer is "
+            "delivered. When a turn ends with a substantive visible answer and "
+            "no terminal tool result while ``terminal_tool_nudge_enabled`` is "
+            "on, every further request is constrained to a tool call and "
+            "nothing is appended to the transcript: each names the terminal "
+            "tool in the provider's native ``tool_choice``, except that the one "
+            "following the run's first terminal-tool refusal marked with "
+            "``TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`` requires any tool "
+            "call, so the model can do the missing work; other refusals are "
+            "forced again by name. Each forced request spends one; so does "
+            "each time the forcing steps aside for a gate's corrective or a "
+            "message for the model (stepping aside because the model resumed "
+            "work does not spend again). Once it is spent the run completes "
+            "on the answer it delivered. 0 completes on the delivered answer "
+            "without forcing."
+        ),
+    )
+    terminal_tool_nudge_write_first_before_forcing: bool = Field(
+        default=False,
+        description=(
+            "Let the write-first nudge come before a forced terminal call. When "
+            "True, a turn that ends with prose while the run has written "
+            "nothing with any of ``terminal_tool_nudge_file_write_tool_names`` "
+            "(and has at least one of those tools) first gets the one-time "
+            "nudge with the ``terminal_tool_nudge_write_first`` prefix, as if "
+            "no answer had been given; the answer the model ends on after it "
+            "is then sealed by force. For hosts whose models tend to announce "
+            "a file and stop. The cost is the nudge's: the request after it is "
+            "free, so a model that had in fact answered may answer again. "
+            "Default False: the prose is sealed at once."
+        ),
+    )
+    terminal_tool_forced_thinking_enabled: bool = Field(
+        default=False,
+        description=(
+            "Whether native thinking stays on for forced terminal-tool "
+            "requests. Off by default: such a request can only produce tool "
+            "calls, and a thinking model given a forced tool choice was "
+            "measured to spend its whole output budget reasoning before the "
+            "constrained call begins, ending length-cut with no call, while "
+            "the same request with thinking off returned the call every time "
+            "in about a second. For a terminal tool whose arguments carry the "
+            "answer text, off also means those arguments are written without "
+            "thinking. Some providers reject a forced tool choice combined "
+            "with extended thinking outright, so turning this on can fail the "
+            "forced request there."
         ),
     )
 
@@ -2848,6 +3029,14 @@ class LoopConstants(BaseModel):
         gt=0,
         description="Compact when context tokens exceed the window minus this reserve.",
     )
+    request_context_safety_tokens: int = Field(
+        default=1024,
+        ge=0,
+        description=(
+            "Tokens kept unused when fitting a complete provider request to the model "
+            "context window, covering provider-side framing and tokenizer differences."
+        ),
+    )
     compaction_manual_enabled: bool = Field(
         default=False,
         description=(
@@ -2906,11 +3095,23 @@ class LoopConstants(BaseModel):
         default=False,
         description=(
             "When true, a tool result the run has moved past is cut to its "
-            "head in the next LLM request, with a line saying how much went "
-            "and that the tool can be called again. Age-aware, unlike "
-            "``tool_result_split_enabled``: the newest results and the "
-            "latest round of calls are never touched. Persist keeps the full "
-            "result. Off by default."
+            "head in the next LLM request, with a line saying how much was "
+            "kept, how much went and that the tool can be called again. "
+            "Age-aware, unlike ``tool_result_split_enabled``: the newest "
+            "results and the latest round of calls are never touched. Off by "
+            "default, which is also what keeps it from cutting twice with "
+            "tier-1 truncation: tier-1 moves an over-threshold result out of "
+            "DURABLE history into a blob when the window is already tight, "
+            "while this rewrites only the outbound copy, and the two are sized "
+            "by different thresholds that no invariant relates. They compose "
+            "safely — a compacted placeholder is never rewritten here, and "
+            "persist keeps the whole value either way — but a deployment that "
+            "turns this on is choosing to send the model less of what it "
+            "already read, and that is not a default anyone should inherit. "
+            "It does NOT delay compaction: the compaction gate measures the "
+            "whole durable transcript, not the trimmed request view, so this "
+            "buys a smaller and cheaper prompt at the provider and the same "
+            "number of compactions."
         ),
     )
     tool_result_fresh_count: int = Field(
@@ -2941,6 +3142,16 @@ class LoopConstants(BaseModel):
             "so costs a cache miss on the whole request, which is worth paying "
             "for a batch of results and not for one — so the rule waits until "
             "there is a batch."
+        ),
+    )
+    tool_result_stale_trim_protected_prefixes: str = Field(
+        default="Cite exactly:,Cite:,cite_as:,Source:",
+        description=(
+            "Comma-separated line prefixes stale-trimming carries over "
+            "verbatim from the part of a result it cuts. A result that tells "
+            "the model how to cite what it read loses that line with the body "
+            "otherwise, and a citation the model cannot see is one it invents. "
+            "Empty turns the carry-over off."
         ),
     )
 
@@ -3005,10 +3216,36 @@ class LoopConstants(BaseModel):
 
     @model_validator(mode="after")
     def _validate_relationships(self) -> Self:
+        if self.request_context_safety_tokens >= self.model_context_window:
+            raise ValueError(
+                "request_context_safety_tokens must be < model_context_window"
+            )
  # routine trigger must be strictly below emergency cliff
         if self.compaction_trigger_ratio >= self.compaction_emergency_ratio:
             raise ValueError(
                 "compaction_trigger_ratio must be < compaction_emergency_ratio"
+            )
+ # the effective trigger sits below the output reserve (where the provider
+ # keeps one inside the window) and a turn's headroom; leave room for both, or
+ # there is no prompt size compaction could aim at
+        output_reserve_ratio = (
+            self.llm_output_max_tokens_ratio
+            if self.provider_reserves_output_in_context_window
+            else 0.0
+        )
+ # the summariser must be able to spend the budget the prompt states: the
+ # output cap has to hold the words plus the envelope around them
+        if self.compaction_summary_envelope_tokens >= (
+            self.compaction_summary_max_output_tokens
+        ):
+            raise ValueError(
+                "compaction_summary_envelope_tokens must be < "
+                "compaction_summary_max_output_tokens"
+            )
+        if output_reserve_ratio + self.compaction_trigger_turn_headroom_ratio >= 1.0:
+            raise ValueError(
+                "llm_output_max_tokens_ratio + compaction_trigger_turn_headroom_ratio "
+                "must be < 1.0 while provider_reserves_output_in_context_window is set"
             )
  # combined overhead budgets must leave room for history
         fixed_overhead = (

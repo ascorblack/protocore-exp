@@ -225,7 +225,8 @@ class RequestManifest(BaseModel):
     tools: ManifestValue
     extra: ManifestValue
     max_tokens: int
-    temperature: float
+    #: ``None`` when the caller left the temperature to the host.
+    temperature: float | None
     tool_count: int
     message_count: int
     #: The constants the request was assembled under. A prompt that changed

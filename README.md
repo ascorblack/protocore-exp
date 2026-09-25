@@ -45,7 +45,7 @@
 ## Установка
 
 ```bash
-pip install protocore==2.0.0a4
+pip install protocore==2.0.0a21
 ```
 
 Версию нужно назвать явно. Опубликован пре-релиз, а pip их пропускает, пока не
@@ -65,7 +65,7 @@ Python ≥ 3.12. Зависимости рантайма — `pydantic`, `jinja2
 ### Дополнительные наборы
 
 ```bash
-pip install "protocore[testing]==2.0.0a4"   # прогнать conformance-наборы на своих адаптерах
+pip install "protocore[testing]==2.0.0a21"   # прогнать conformance-наборы на своих адаптерах
 ```
 
 `testing` добавляет только тест-раннер: `protocore.conformance` — это pytest-набор,
@@ -88,11 +88,9 @@ pip install "protocore[testing]==2.0.0a4"   # прогнать conformance-на�
 
 ## Быстрый старт
 
-Ядро управляется адаптерами: соберите `QueryEngine` со своими адаптерами,
-положите в историю сообщение пользователя и итерируйте. `query(engine)` —
-**синхронная** функция: она сбрасывает состояние хода и возвращает асинхронный
-итератор. Она намеренно не async-генератор, поэтому сброс происходит в момент
-вызова, а не на первом `__anext__`.
+Ядро управляется адаптерами: соберите `QueryEngine` со своими адаптерами и
+итерируйте события `engine.run(message)`. Метод добавляет сообщение пользователя
+и ведёт один ход до терминального состояния.
 
 Пример ниже использует встроенные in-memory адаптеры, поэтому запускается как
 есть:
@@ -104,7 +102,6 @@ from protocore import (
     Message, MessageRole, StopReason, TextBlock, default_runtime_constants,
 )
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
-from protocore.runtime.query import query
 from protocore.tests_support.adapters import (
     InMemoryBlobStore, InMemoryEventStream, InMemoryHookManager,
     InMemoryLLMProvider, InMemorySkillStore, InMemoryToolRegistry,
@@ -130,11 +127,11 @@ async def main() -> None:
         skill_store=InMemorySkillStore(),
         blob_store=InMemoryBlobStore(),
     )
-    engine.history.append(
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="Поздоровайся.")])
+    message = Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text="Поздоровайся.")],
     )
-
-    async for event in query(engine):
+    async for event in engine.run(message):
         print(event.type)
     print("final state:", engine.state)
 

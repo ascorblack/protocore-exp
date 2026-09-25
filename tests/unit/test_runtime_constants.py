@@ -37,7 +37,16 @@ def test_compaction_trigger_derivation_lives_in_budgets() -> None:
 
     small = derive_budgets(LoopConstants(model_context_window=32_768))
     large = derive_budgets(LoopConstants(model_context_window=200_000))
-    assert small.compaction_trigger_tokens == int(32_768 * 0.8)
+    # Under stock ratios the acceptable-prompt ceiling binds before the ratio
+    # does, so the trigger is that ceiling rather than 0.8 of the window.
+    rc_small = LoopConstants(model_context_window=32_768)
+    assert small.compaction_trigger_tokens == (
+        32_768
+        - int(32_768 * rc_small.llm_output_max_tokens_ratio)
+        - rc_small.request_context_safety_tokens
+        - int(32_768 * rc_small.compaction_trigger_turn_headroom_ratio)
+    )
+    assert small.compaction_trigger_tokens < int(32_768 * 0.8)
     assert large.compaction_trigger_tokens > small.compaction_trigger_tokens
 
 

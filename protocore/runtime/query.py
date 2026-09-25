@@ -28,6 +28,7 @@ Lifecycle (one invocation = one turn):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -43,7 +44,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from protocore.contracts.agent_dispatch import IDelegationTool
 from protocore.contracts.background import describe_finished_task
@@ -116,6 +117,7 @@ from protocore.contracts.turn_policy import (
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_BACKGROUND_WAKE,
     SYNTHETIC_RECOVERY_CIRCUIT_BREAKER,
     SYNTHETIC_RECOVERY_GUARANTEED_TERMINAL,
     SYNTHETIC_RECOVERY_LONGFILE_CONTINUE,
@@ -130,6 +132,7 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     SYNTHETIC_RECOVERY_TERMINAL_TOOL_NUDGE,
     SYNTHETIC_RECOVERY_THINKING_CONTINUE,
+    TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY,
     TERMINAL_TOOL_METADATA_KEY,
     TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
     ContentBlock,
@@ -144,6 +147,7 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.logging_utils import get_logger
+from protocore.runtime import forced_terminal as _forced_terminal
 from protocore.runtime import longfile_convergence as _longfile
 from protocore.runtime import pending_reads as _pending_reads
 from protocore.runtime import run_tool_preconditions as _preconditions
@@ -152,7 +156,6 @@ from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
     current_tool_batch_protect_index,
-    estimate_history_tokens_uncalibrated,
 )
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.error_kinds import (
@@ -197,7 +200,17 @@ from protocore.runtime.loop_guard import (
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.loop_strategies import select_strategy
 from protocore.runtime.prompt_caching import apply_system_and_3
-from protocore.runtime.result_eviction import evict_history_for_llm, tool_name_for_result
+from protocore.runtime.request_budget import (
+    count_request_tokens_exactly,
+    estimate_request_prompt_tokens_uncalibrated,
+    fit_request_to_context_measured,
+    near_limit,
+)
+from protocore.runtime.result_eviction import (
+    evict_history_for_llm,
+    tool_name_for_result,
+    tool_names_by_call_id,
+)
 from protocore.runtime.run_work_budget import (
     SUBAGENT_RUN_BUDGET_SHORT,
     ChildRunGrant,
@@ -207,7 +220,6 @@ from protocore.runtime.skill_index import (
     derive_skill_index_budget_tokens,
     render_skills_catalog,
 )
-from protocore.runtime.stale_result_trim import trim_stale_results
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
 from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_dispatch import (
@@ -230,7 +242,6 @@ from protocore.runtime.tool_surface import (
     note_surface_described,
     read_tool_surface,
     surface_needs_describing,
-    tool_surface_tokens,
 )
 from protocore.runtime.turn_policies import (
     RunCounter,
@@ -257,7 +268,10 @@ from protocore.runtime.turn_policies.sibling_walk import (
 from protocore.runtime.turn_policies.sibling_walk import (
     prose_gate_just_injected as _prose_gate_injected,
 )
-from protocore.runtime.turn_policies.terminal_nudge import TerminalNudgePolicy
+from protocore.runtime.turn_policies.terminal_nudge import (
+    ForcedTerminalCall,
+    TerminalNudgePolicy,
+)
 from protocore.runtime.turn_policies.terminal_tool_finish import (
     TerminalToolFinishPolicy,
 )
@@ -330,77 +344,48 @@ def _append_thinking_continue_prompt(engine: QueryEngine) -> None:
 
 
 def _step_reasoning_after_cut(engine: QueryEngine, round_: int) -> str | None:
-    """Turn one knob down for the retry after a reasoning-only length cut.
-
-    Round 1 lowers the effort to ``low``; round 2 switches thinking off. Each
-    step is skipped when it would change nothing, and a step the run mode
-    forbids (``deep`` keeps thinking on) is skipped the same way, so the value
-    returned says what the retry actually differs by — ``None`` when nothing
-    is left to change and the ladder is spent. The values as they stood before
-    the first step are kept for :func:`_restore_reasoning_after_cut`.
-    """
-    if engine._reasoning_cut_saved is None:
-        engine._reasoning_cut_saved = (
-            engine._live_thinking_enabled,
-            engine._live_reasoning_effort,
-        )
-    # The ladder is laid out from where the knobs stood BEFORE the first
-    # step, so the second round finds its step where the first left it.
-    saved_thinking, saved_effort = engine._reasoning_cut_saved
-    thinking = engine.config.thinking_enabled if saved_thinking is None else saved_thinking
-    effort = saved_effort or engine.config.reasoning_effort
-    steps: list[tuple[str, Callable[[], None]]] = []
-    if thinking and effort != "low":
-        steps.append(
-            ("reasoning_effort=low", partial(engine.apply_live_controls, reasoning_effort="low"))
-        )
+    """Apply the next bounded control change after a reasoning-only cut."""
+    if round_ == 1 and engine.effective_reasoning_effort != "low":
+        engine._reasoning_recovery_effort = "low"
+        return "reasoning_effort=low"
     if (
-        thinking
-        and engine.config.rc.reasoning_length_cut_disable_thinking
+        engine.config.rc.reasoning_length_cut_disable_thinking
         and engine.config.run_mode != "deep"
+        and engine.effective_thinking_enabled
     ):
-        steps.append(
-            ("thinking=off", partial(engine.apply_live_controls, thinking_enabled=False))
-        )
-    if round_ < 1 or round_ > len(steps):
-        return None
-    name, step = steps[round_ - 1]
-    step()
-    return name
+        engine._reasoning_recovery_thinking_enabled = False
+        return "thinking=off"
+    return None
 
 
 def _restore_reasoning_after_cut(engine: QueryEngine) -> None:
-    """Put thinking and effort back after the retries a cut round started."""
-    saved = engine._reasoning_cut_saved
-    if saved is None:
-        return
-    engine._live_thinking_enabled, engine._live_reasoning_effort = saved
-    engine._reasoning_cut_saved = None
+    """Restore operator-selected controls after length-cut recovery."""
+    engine.clear_reasoning_recovery_overrides()
 
 
 def _append_reasoning_cut_nudge(engine: QueryEngine) -> None:
-    """Name the cut and ask for a shorter shape; the cut reasoning is not kept."""
     engine.history.append(
         Message(
             role=MessageRole.user,
             content_blocks=[
                 TextBlock(text=engine.config.rc.reasoning_length_cut_nudge_text)
             ],
-            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_REASONING_CUT},
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_REASONING_CUT
+            },
         )
     )
 
 
 def _policy_reasoning_cut_event(
-    engine: QueryEngine, round_: int, changed: str, reasoning_chars: int
+    engine: QueryEngine, round_: int, control_change: str, reasoning_chars: int
 ) -> TurnEvent:
-    """Say a cut retry is going out, what it changed, and what the cut round cost."""
     _logger.warning(
-        "reasoning-only length cut in run %s: %s chars of reasoning and no answer; retry %s with %s",
-        engine.config.run_id,
+        "reasoning-only length cut: %s chars of reasoning and no answer; "
+        "retry %s with %s",
         reasoning_chars,
         round_,
-        changed,
+        control_change,
     )
     return TurnEvent(
         type=EventType.STATE_CHANGED,
@@ -410,7 +395,7 @@ def _policy_reasoning_cut_event(
             "to": engine.state.value,
             "reason": "reasoning_length_cut_retry",
             "round": round_,
-            "changed": changed,
+            "changed": control_change,
             "reasoning_content_chars": reasoning_chars,
         },
     )
@@ -475,6 +460,19 @@ def _reset_empty_rounds(engine: QueryEngine) -> None:
     engine._consecutive_empty_responses = 0
 
 
+def _reasoning_cut_rounds_spent(engine: QueryEngine) -> int:
+    return engine._reasoning_length_cut_count
+
+
+def _charge_reasoning_cut_round(engine: QueryEngine) -> int:
+    engine._reasoning_length_cut_count += 1
+    return engine._reasoning_length_cut_count
+
+
+def _reset_reasoning_cut_rounds(engine: QueryEngine) -> None:
+    engine._reasoning_length_cut_count = 0
+
+
 def _policy_commit_usage(
     engine: QueryEngine,
     *,
@@ -525,7 +523,25 @@ def _policy_transient_retry_event(
     backoff_seconds: float,
     exc: BaseException,
 ) -> TurnEvent:
-    """Say that the same endpoint will be tried again, and after how long."""
+    """Say that the same endpoint will be tried again, and after how long.
+
+    Said twice, because the two readers are different. The event is for the
+    host, which surfaces a run that is waiting rather than one that is stuck;
+    the warning is for whoever reads the logs afterwards and needs the run id
+    and which attempt this was, since a retry that then succeeds leaves no
+    other trace of the failure it recovered from.
+    """
+    _logger.warning(
+        "DIAG query.transient_llm_error_retry run=%s tenant=%s error_class=%s "
+        "attempt=%d/%d backoff_seconds=%.3f message=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        kind,
+        attempt,
+        engine.config.rc.llm_transient_error_retry_max_attempts,
+        backoff_seconds,
+        exc,
+    )
     return TurnEvent(
         type=EventType.STATE_CHANGED,
         run_id=engine.config.run_id,
@@ -538,6 +554,24 @@ def _policy_transient_retry_event(
             "backoff_seconds": backoff_seconds,
             "primary_error": str(exc),
         },
+    )
+
+
+def _policy_log_stream_failure(engine: QueryEngine, exc: BaseException) -> None:
+    """Name the run a stream attempt failed on, before the recovery is chosen.
+
+    Every failed attempt is logged here, including the ones a retry or a
+    sibling provider then rescues: without it a run that recovered records
+    nothing about what it recovered from, and a provider degrading under load
+    looks from the logs like a provider that is fine.
+    """
+    _logger.warning(
+        "DIAG query.stream_failed run=%s tenant=%s turn=%s exception=%s message=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        engine.turn_id(),
+        type(exc).__name__,
+        exc,
     )
 
 
@@ -1010,6 +1044,8 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
     )
     view = apply_checkpoint(view, getattr(engine, "compact_checkpoint", None))
     if engine.config.rc.tool_result_stale_trim_enabled:
+        from protocore.runtime.stale_result_trim import trim_stale_results
+
         # After the checkpoint, so a compacted head is already a summary and
         # cannot be cut twice; before the split, which the trimmer knows and
         # keeps a shortened result under the split's own limit for, so it
@@ -1360,6 +1396,7 @@ async def _maybe_place_background_wakes(
         Message(
             role=MessageRole.user,
             content_blocks=[TextBlock(text=text)],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_BACKGROUND_WAKE},
         )
     )
     persist_history(engine)
@@ -1508,14 +1545,6 @@ def _observability_context(
     )
 
 
-# The request contract's own default, so the one temperature policy below
-# states a value on every path without repeating a literal that already lives
-# on the contract.
-_DEFAULT_REQUEST_TEMPERATURE: Final[float] = float(
-    LLMRequest.model_fields["temperature"].default
-)
-
-
 def build_llm_request(
     *,
     model: str,
@@ -1526,6 +1555,7 @@ def build_llm_request(
     thinking_enabled: bool | None = None,
     reasoning_effort: str | None = None,
     forced_tool_choice: str | None = None,
+    tool_choice_required: bool = False,
     response_format: Mapping[str, Any] | None = None,
     cache_breakpoints: Sequence[CacheBreakpoint] | None = None,
     observability: LLMObservabilityContext | None = None,
@@ -1546,9 +1576,15 @@ def build_llm_request(
       and it carries the tool NAME; a provider adapter renders it into whatever
       native single-tool ``tool_choice`` shape its wire wants. Stating the same
       intent in two spellings meant a single reader could not tell whether a
-      turn had been forced.
-    * **the temperature**. Stated on every request: the caller's value, or the
-      request contract's default when the caller has no opinion.
+      turn had been forced. ``extra["tool_choice_required"] = True`` is the
+      weaker constraint beside it — some tool call, any advertised one — which
+      an OpenAI-compatible adapter renders as ``tool_choice="required"``. A
+      request carries at most one of the two; a named tool wins.
+    * **the temperature**. The caller's value when it has one, and ``None``
+      otherwise. A path with no opinion (the action stream, the deep loop's
+      plan call and its fallback) leaves the choice to the host, which may
+      apply a per-model setting or let the server's own generation config
+      decide; a path that needs a specific value (the summariser) states it.
 
     ``thinking_enabled`` and ``reasoning_effort`` travel as a pair or not at
     all — the effort bounds the CoT, and thinking requested without it was
@@ -1574,6 +1610,8 @@ def build_llm_request(
         extra["reasoning_effort"] = reasoning_effort
     if forced_tool_choice is not None:
         extra["forced_tool_choice"] = forced_tool_choice
+    elif tool_choice_required:
+        extra["tool_choice_required"] = True
     if response_format is not None:
         extra["response_format"] = dict(response_format)
     return LLMRequest(
@@ -1581,9 +1619,7 @@ def build_llm_request(
         messages=list(messages),
         tools=list(tools),
         max_tokens=max_tokens,
-        temperature=(
-            _DEFAULT_REQUEST_TEMPERATURE if temperature is None else temperature
-        ),
+        temperature=temperature,
         extra=extra,
         observability=observability,
     )
@@ -2189,6 +2225,7 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     # than the routine gated pass, so the wire payload is aggressively shrunk
     # before the first stream. RC-gated kill-switch
     # (``compaction_emergency_proactive_enabled``, default on).
+    await _calibrate_near_compaction_trigger(engine)
     _emergency_turn_start = (
         engine.config.rc.compaction_emergency_proactive_enabled
         and engine.needs_emergency_compaction()
@@ -2200,25 +2237,6 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
             reason="proactive_emergency" if _emergency_turn_start else "routine",
         ):
             yield evt
-        # If compaction transitioned to FAILED, surface the terminal
-        # message_stop now and bail.
-        if engine.state is LoopState.FAILED:
-            # a compaction-exhausted FAILED terminal can persist a
-            # history whose last assistant turn (or a turn compaction kept)
-            # carries a tool_use with no result; pair it before the snapshot.
-            _synthesize_missing_tool_results(
-                engine.history,
-                error_content=engine.prompt_text("tool_result_interrupted"),
-            )
-            yield TurnEvent(
-                type=EventType.MESSAGE_STOP,
-                run_id=engine.config.run_id,
-                payload={
-                    "turn_id": engine.turn_id(),
-                    "stop_reason": StopReason.error.value,
-                },
-            )
-            return
 
     # ── 3. UserPromptSubmit hook ─────────────────────────────────────
     hook_result = await _safe_hook_invoke(
@@ -2435,6 +2453,105 @@ async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
 # ----------------------------------------------------------------------
 
 
+def _suspend_proactive_compaction(engine: QueryEngine) -> None:
+    """Stand the proactive summariser tiers down after the budget ran out.
+
+    Bounded two ways, whichever comes first: a number of gate visits, and
+    growth of the prompt past a fraction of its size now. A context refusal —
+    by the provider or by the local fit — lifts it sooner, through
+    :func:`_lift_proactive_suspension`.
+    """
+    rc = engine.context_manager._rc
+    engine._proactive_suspension_gates_left = rc.compaction_proactive_suspension_iterations
+    engine._proactive_suspension_prompt_tokens = (
+        engine.context_manager.current_prompt_tokens(engine.history)
+    )
+    engine._idle_compaction_probe = None
+
+
+def _lift_proactive_suspension(engine: QueryEngine) -> None:
+    engine._proactive_suspension_gates_left = 0
+    engine._proactive_suspension_prompt_tokens = 0
+    engine._idle_compaction_probe = None
+
+
+def _current_prompt_tokens(engine: QueryEngine) -> int:
+    """The calibrated size of the run's prompt as it stands."""
+    return engine.context_manager.current_prompt_tokens(engine.history)
+
+
+def _proactive_llm_tiers_allowed(engine: QueryEngine) -> bool:
+    """Whether this gate visit may use the summariser tiers; counts the visit down."""
+    if engine._proactive_suspension_gates_left <= 0:
+        return True
+    rc = engine.context_manager._rc
+    grown_past = engine._proactive_suspension_prompt_tokens * (
+        1.0 + rc.compaction_proactive_suspension_growth_ratio
+    )
+    if engine.context_manager.current_prompt_tokens(engine.history) >= grown_past:
+        _lift_proactive_suspension(engine)
+        return True
+    engine._proactive_suspension_gates_left -= 1
+    if engine._proactive_suspension_gates_left == 0:
+        # The last suspended visit: the next one runs every tier again.
+        engine._idle_compaction_probe = None
+    return False
+
+
+def _proactive_pass_is_idle(
+    engine: QueryEngine,
+    *,
+    force: bool,
+    protect_tail_from_index: int | None,
+    llm_tiers: bool,
+) -> bool:
+    """Whether a proactive pass should not be opened at all.
+
+    Two reasons, cheapest first:
+
+    * the last probe found nothing to do, and the history is the same list of
+      the same (immutable) messages, judged under the same constants and the
+      same profile, so the answer is the same;
+    * the tiers, asked without running, find nothing this profile may touch.
+
+    ``llm_tiers=False`` (a suspension is in force) asks about Tier 1 alone.
+
+    A pass with nothing to do would otherwise flip the run into
+    ``COMPACTING``, fire hooks, write a usage row and a snapshot on every
+    iteration while the estimate stays over the gate — and change nothing.
+    """
+    history = engine.history
+    rc = engine.context_manager._rc
+    profile = (force, protect_tail_from_index, llm_tiers)
+    probe = engine._idle_compaction_probe
+    if (
+        probe is not None
+        and probe[0] == profile
+        and probe[1] is rc
+        and len(probe[2]) == len(history)
+        and all(seen is current for seen, current in zip(probe[2], history, strict=True))
+    ):
+        return True
+    if engine.context_manager.has_proactive_work(
+        history,
+        engine.compaction_state,
+        force=force,
+        protect_tail_from_index=protect_tail_from_index,
+        llm_tiers=llm_tiers,
+    ):
+        engine._idle_compaction_probe = None
+        return False
+    engine._idle_compaction_probe = (profile, rc, tuple(history))
+    _logger.warning(
+        "DIAG compaction.nothing_eligible run=%s force=%s llm_tiers=%s messages=%d",
+        engine.config.run_id,
+        force,
+        llm_tiers,
+        len(history),
+    )
+    return True
+
+
 async def _run_compaction(
     engine: QueryEngine,
     *,
@@ -2458,8 +2575,29 @@ async def _run_compaction(
     >keep parallel batch's fresh, unconsumed results are never
     blobbed/summarised before the next assistant stream consumes them. The
     turn-start gate and reactive-413 path pass ``None`` (no in-flight batch).
+
+    Every pass driven from here is proactive — decided on an estimate, before
+    the provider has refused anything. Two consequences:
+
+    * A pass that would find nothing its profile may touch is not opened at
+      all (:func:`_proactive_pass_is_idle`): no ``COMPACTING`` flip, no events,
+      hooks, usage row or snapshot.
+    * A pass that exhausts the retry budget does not end the run. The request
+      still goes out and the summariser tiers stand down for a bounded stretch
+      (:func:`_suspend_proactive_compaction`) while Tier 1, which needs no
+      LLM, keeps running; a context refusal hands over to the reactive path —
+      the only one that may compact seeded history.
     """
     from protocore.runtime.context.budgets import derive_budgets
+
+    llm_tiers = _proactive_llm_tiers_allowed(engine)
+    if _proactive_pass_is_idle(
+        engine,
+        force=force,
+        protect_tail_from_index=protect_tail_from_index,
+        llm_tiers=llm_tiers,
+    ):
+        return
 
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
@@ -2543,6 +2681,7 @@ async def _run_compaction(
             ),
             protect_tail_from_index=protect_tail_from_index,
             record_request=_record_summariser_request,
+            llm_tiers=llm_tiers,
         )
     except CompactionExhaustedError as exc:
         # The transaction opened at ``pre_compact`` and cannot close on
@@ -2554,20 +2693,29 @@ async def _run_compaction(
         )
         if rollback_evt is not None:
             yield rollback_evt
+        # Nothing has been rejected yet: the estimate that opened this pass is
+        # not proof the request does not fit, and the profile that failed is
+        # not the one that may compact seeded history. Stand the summariser
+        # tiers down for a bounded stretch and let the request go out; a
+        # context refusal reaches the reactive path, which lifts it sooner.
+        _suspend_proactive_compaction(engine)
+        _logger.warning(
+            "DIAG compaction.proactive_suspended run=%s reason=%s err=%s",
+            engine.config.run_id,
+            reason,
+            exc,
+        )
         compacting_from = engine.state
-        engine.transition_to(LoopState.FAILED)
+        engine.transition_to(LoopState.RUNNING)
         yield _emit_state_change(
             engine,
             compacting_from,
-            LoopState.FAILED,
-            reason=str(exc),
-        )
-        yield TurnEvent(
-            type=EventType.ERROR,
-            run_id=engine.config.run_id,
-            payload={"kind": "compaction_exhausted", "message": str(exc)},
+            LoopState.RUNNING,
+            reason="compaction_exhausted_proactive_suspended",
         )
         return
+
+    engine._proactive_compaction_attempted_for_next_message = True
 
     yield TurnEvent(
         type=EventType.COMPACTION_COMPLETED,
@@ -2610,10 +2758,9 @@ async def _run_compaction(
     if compact_usage is not None:
         yield compact_usage
 
-    # The last real prompt measurement now describes a pre-compaction history
-    # that no longer exists. Clear it so the gate does not re-fire on a stale
-    # high-water mark: the freshly-shrunk history is re-measured by the cheap
-    # estimate until the next LLM call reports a new ground-truth prompt size.
+    # The diagnostic scalar describes the pre-compaction request. Clear it so
+    # snapshots and telemetry do not present it as a measurement of the newly
+    # rewritten history; request budgeting uses the calibrated current shape.
     engine.last_observed_prompt_tokens = 0
 
     # Snapshot after compaction completion
@@ -2814,6 +2961,10 @@ async def _advance_provider_chain(
     engine._provider_chain_advances += 1
     engine.llm = chain.current()
     engine.config = replace(engine.config, model_name=chain.current_model_name())
+    engine.set_token_estimate_calibration(
+        engine._token_estimate_calibration_baseline,
+        model_name=chain.current_model_name(),
+    )
     return chain.current_model_name()
 
 
@@ -3145,7 +3296,13 @@ async def _stream_one_assistant_message(
 
         # Reset per-message recovery state at every new assistant
         # message — the budget is per-message, not per-run.
+        proactive_compaction_attempted = (
+            engine._proactive_compaction_attempted_for_next_message
+        )
         engine.reset_recovery_state()
+        engine._proactive_compaction_attempted_for_next_message = False
+        if proactive_compaction_attempted:
+            engine._compaction_attempted_for_current_turn = True
 
         # #1/#4 — advance to this round's wire turn id + restart block_idx at 0
         # BEFORE emitting ``message_start``. ``engine.turn_id()`` now yields a
@@ -3293,6 +3450,12 @@ async def _stream_one_assistant_message(
                 # that grew apart. The partial the reader already saw is put
                 # in the transcript first, so whatever recovery is chosen
                 # carries it forward.
+                if _forced_terminal.request_mode(engine) is not None:
+                    stream_result.tool_calls = (
+                        _drop_calls_a_forced_turn_does_not_admit(
+                            engine, stream_result.tool_calls
+                        )
+                    )
                 _persist_partial_attempt_to_history(engine, stream_result)
                 _turn = _turn_at(engine, flags, TurnCoordinate.stream_failed,
                     stream_error=exc,
@@ -3322,6 +3485,16 @@ async def _stream_one_assistant_message(
                 # as what it is.
                 raise
 
+
+            # A forced terminal turn carries only what its mode admits, whatever
+            # the provider did with the constraint. Dropped here — before the
+            # truncation recovery, the repeat guard and the transcript see the
+            # round — they are never run, never answered and never read as
+            # work.
+            if _forced_terminal.request_mode(engine) is not None:
+                stream_result.tool_calls = _drop_calls_a_forced_turn_does_not_admit(
+                    engine, stream_result.tool_calls
+                )
 
             # ── The output budget ran out before the round finished ────
             # Mid-sentence or mid-way through a tool call's arguments: either
@@ -3430,9 +3603,9 @@ async def _stream_one_assistant_message(
             text_emitted=bool(text_buffer),
             reasoning_emitted=bool(reasoning_buffer),
             reasoning_chars=len(reasoning_buffer),
+            finish_reason=stream_result.finish_reason or "",
             tool_calls_pending=bool(pending_tool_calls),
             tool_results_ready=tool_results_ready_at is not None,
-            finish_reason=stream_result.finish_reason,
             record_partial_attempt=partial(
                 _persist_partial_attempt_to_history, engine, stream_result
             ),
@@ -4272,6 +4445,8 @@ async def _stream_one_assistant_message(
         # The results of the batch just dispatched are in history and the
         # next stream is about to be built from all of it — the seam where
         # the transcript grows, and so the seam the compaction gate sits at.
+        if engine.config.rc.compaction_per_iteration_enabled:
+            await _calibrate_near_compaction_trigger(engine)
         _turn = _turn_at(engine, flags, TurnCoordinate.iteration_end)
         async for _policy_evt in policies.apply(_turn):
             yield _policy_evt
@@ -4440,6 +4615,9 @@ async def _drive_one_stream(
     max_output_tokens = _apply_terminal_synthesis_output_reserve(
         engine, max_output_tokens, output_cap_before_band
     )
+    max_output_tokens = _apply_context_overflow_retry_output_cap(
+        engine, max_output_tokens
+    )
     full_messages = _prepend_system_sections(
         context.system_prompt_sections,
         context.messages,
@@ -4518,7 +4696,45 @@ async def _drive_one_stream(
     # stream a half-written file spends unfinished), while the pending-read set
     # is durable and loses nothing by waiting a turn.
     precondition_tool = _preconditions.outstanding_tool(engine)
-    if precondition_tool is not None:
+    # A delivered answer whose terminal call is still owed takes the slot from
+    # everything but a precondition: the call is the only thing left for the
+    # run to do, so a convergence hint or a read-back cannot be served by this
+    # request anyway, and neither loses anything by staying pending.
+    forced_terminal_mode = (
+        _forced_terminal.request_mode(engine) if precondition_tool is None else None
+    )
+    tool_choice_required = False
+    if forced_terminal_mode is not None:
+        terminal_tool = _resolved_terminal_tool_name(engine) or ""
+        advertised_terminal = next(
+            (
+                t.name
+                for t in context.tools
+                if _is_terminal_tool_name(getattr(t, "name", None), terminal_tool)
+            ),
+            None,
+        )
+        if advertised_terminal is not None:
+            if forced_terminal_mode == _forced_terminal.MODE_TERMINAL:
+                forced_tool_choice = advertised_terminal
+            else:
+                tool_choice_required = True
+        else:
+            # The terminal tool is pinned while the call is owed, so only a
+            # surface that blocks it outright lands here. Nothing can force it,
+            # so the bound is spent now and the run completes on its answer at
+            # the next turn start; this request still goes out, with its text
+            # suppressed and every call it returns dropped, like any other
+            # forced turn's.
+            _forced_terminal.spend_all(engine)
+            # Nothing on this request may run, whatever mode it was chosen in.
+            _forced_terminal.set_request_mode(engine, _forced_terminal.MODE_TERMINAL)
+            _logger.warning(
+                "DIAG forced_terminal.not_advertised run=%s tool=%s",
+                engine.config.run_id,
+                terminal_tool,
+            )
+    elif precondition_tool is not None:
         # Unlike the hint below, an unforceable precondition is charged as a
         # SPENT attempt rather than deferred: the caller was promised this
         # call, so a surface that never offers the tool has to end the run
@@ -4612,14 +4828,31 @@ async def _drive_one_stream(
     # description on an event nobody received.
     if advert.describes:
         note_surface_described(advert.digest, advert.audience)
+    request_model = engine.effective_model_name
+    if engine._token_estimate_calibration_model != request_model:
+        engine.set_token_estimate_calibration(
+            engine._token_estimate_calibration_baseline,
+            model_name=request_model,
+        )
+    # A live model switch may be applied while the advertised-surface event is
+    # in the consumer's hands. Re-read both the request model and its bound
+    # calibration before the hard fit; the values captured at function entry
+    # may describe the previous model.
+    rc = engine.config.rc
     request = build_llm_request(
-        model=engine.effective_model_name,
+        model=request_model,
         messages=full_messages,
         tools=context.tools,
         max_tokens=max_output_tokens,
-        thinking_enabled=engine.effective_thinking_enabled,
+        thinking_enabled=(
+            False
+            if forced_terminal_mode is not None
+            and not rc.terminal_tool_forced_thinking_enabled
+            else engine.effective_thinking_enabled
+        ),
         reasoning_effort=engine.effective_reasoning_effort,
         forced_tool_choice=forced_tool_choice,
+        tool_choice_required=tool_choice_required,
         cache_breakpoints=cache_breakpoints,
         observability=_observability_context(
             engine,
@@ -4627,6 +4860,21 @@ async def _drive_one_stream(
             call_category=_provider_call_category(engine),
         ),
     )
+    # Cleared before the fit: a fit that refuses the request locally raises the
+    # same exception a provider does, and the rejection handler must not read
+    # a size the provider never saw as evidence about this request.
+    engine._last_dispatched_prompt = None
+    counted_request = request
+    fitted = await fit_request_to_context_measured(
+        request,
+        rc,
+        engine.llm,
+        cache=engine._exact_token_counts,
+        on_measured=lambda measured: _calibrate_token_estimate(
+            engine, counted_request, measured, exact=True
+        ),
+    )
+    request = fitted.request
 
     block_idx = engine.next_block_idx()
     # Track the KIND of the currently-open content block, not a bare
@@ -4674,6 +4922,11 @@ async def _drive_one_stream(
         )
     await _manifest_request(engine, request, call_purpose="run")
 
+    # Capture the post-fit value that is actually handed to the provider. If
+    # this call is rejected for context length, its retry ceiling must be
+    # derived from this wire cap rather than from the larger pre-fit budget.
+    engine._last_fitted_request_max_tokens = request.max_tokens
+    engine._last_dispatched_prompt = (request.model, fitted.raw_estimate)
     upstream = engine.llm.stream_with_tools(request)
 
     # Decide ONCE, up-front, whether this turn's visible assistant TEXT is the
@@ -4686,6 +4939,11 @@ async def _drive_one_stream(
     # are NEVER affected — only the user-facing text leak. See
     # :func:`_suppress_terminal_only_meta_text`.
     suppress_meta_text = _suppress_terminal_only_meta_text(engine)
+    # Calls a forced terminal turn does not admit are dropped once the turn
+    # settles; their frames are withheld from the live stream too, or a reader
+    # would render a tool call under the answer that never runs and never gets
+    # a result.
+    withheld_call_ids: set[str] = set()
 
     # ── Leading-narration split, for a run that delegated ──
     # ``head_buffer`` holds the start of this message's FIRST text block off the
@@ -4821,8 +5079,9 @@ async def _drive_one_stream(
             # inclusive of any cache-read portion) into ``input_tokens``, so it
             # already reflects total context-window occupancy — do NOT add
             # ``cache_read`` on top (that subset is already inside input_tokens
-            # and would double-count). Floors the compaction gate against the
-            # char heuristic, which under-counts adversarial content 2-3x.
+            # and would double-count). It trains the model-bound calibration
+            # applied to later current-request estimates; the scalar itself is
+            # never reused as a different request's floor.
             if input_tokens > 0:
                 engine.last_observed_prompt_tokens = input_tokens
                 _calibrate_token_estimate(engine, request, input_tokens)
@@ -4941,6 +5200,33 @@ async def _drive_one_stream(
                 block_idx=block_idx,
             ):
                 yield evt
+            continue
+
+        if delta.kind is ProviderDeltaKind.tool_use_start and (
+            delta.tool_call_id
+            and delta.tool_name
+            and _forced_terminal.request_mode(engine) is not None
+            and not _forced_terminal_admits(engine, delta.tool_name)
+        ):
+            engine.remember_tool_name(delta.tool_call_id, delta.tool_name)
+            withheld_call_ids.add(delta.tool_call_id)
+            continue
+
+        if (
+            delta.kind
+            in (ProviderDeltaKind.tool_use_input, ProviderDeltaKind.tool_use_stop)
+            and delta.tool_call_id in withheld_call_ids
+        ):
+            if delta.kind is ProviderDeltaKind.tool_use_stop and delta.tool_call_id:
+                # Recorded on the attempt so the settle step drops it by the
+                # same rule, with the same log line; never sent to the reader.
+                result.tool_calls.append(
+                    ToolCall(
+                        id=delta.tool_call_id,
+                        name=engine.tool_name_for(delta.tool_call_id),
+                        arguments=delta.tool_input_final or {},
+                    )
+                )
             continue
 
         if delta.kind is ProviderDeltaKind.tool_use_start:
@@ -5063,7 +5349,13 @@ async def _drive_one_stream(
         open_block_kind = None
 
 
-def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed: int) -> None:
+def _calibrate_token_estimate(
+    engine: QueryEngine,
+    request: LLMRequest,
+    observed: int,
+    *,
+    exact: bool = False,
+) -> None:
     """Scale the token heuristic to the size the provider just reported for this request.
 
     The heuristic sizes everything the tiers decide on — which units are worth
@@ -5082,42 +5374,247 @@ def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed
     two readings share entries instead of evicting each other — and the tool
     definitions are costed once per surface digest, which for a deployment
     whose registry is not changing is once.
+
+    ``exact`` marks a count the provider made of this very request before it
+    was sent, rather than a usage figure reported after it. Such a count is not
+    a noisy reading to be averaged in: the factor is set to it outright, so the
+    decisions taken before the next usage report are already in its tokens.
     """
+    if request.model != engine.effective_model_name:
+        return
+    if engine._token_estimate_calibration_model != request.model:
+        engine.set_token_estimate_calibration(
+            engine._token_estimate_calibration_baseline,
+            model_name=request.model,
+        )
     rc = engine.config.rc
     if not rc.token_estimate_calibration_enabled or observed <= 0:
         return
-    raw = estimate_history_tokens_uncalibrated(list(request.messages), rc)
-    raw += tool_surface_tokens(read_tool_surface(request.tools), rc)
+    raw = estimate_request_prompt_tokens_uncalibrated(request, rc)
     if raw <= 0:
         return
+    if exact:
+        engine._exact_count_model = request.model
     measured = min(max(observed / raw, 1.0), 4.0)
     current = rc.token_estimate_calibration
-    smoothed = round(current + (measured - current) * 0.5, 3)
+    smoothed = round(measured if exact else current + (measured - current) * 0.5, 3)
     if abs(smoothed - current) < 0.02:
         return
-    calibrated = rc.model_copy(update={"token_estimate_calibration": smoothed})
-    engine.config = replace(engine.config, rc=calibrated)
-    engine.context_manager.update_rc(calibrated)
+    engine.set_token_estimate_calibration(smoothed, model_name=request.model)
+
+
+def _calibrate_from_context_rejection(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> None:
+    """Raise the estimate factor to what a provider's rejection proves.
+
+    A rejection for length is a measurement, if only a one-sided one. The
+    provider refused a request whose prompt the loop had sized at ``raw``
+    heuristic tokens and whose output cap it knows, so the prompt was at least
+    the window less that cap — whatever the provider's message does or does not
+    quote. Usage never arrives for a rejected request, so without this the
+    factor stays where it was and the recovery that follows sizes history with
+    the same undercount that let the request through.
+
+    Only ever raises the factor, and only to the proven floor: the rejection
+    says nothing about how far above it the prompt was. When the provider did
+    quote an exact prompt size, that size is used instead, as an exact count.
+    A rejection the loop raised itself, before anything was sent, carries no
+    provider evidence and changes nothing.
+    """
+    dispatched = engine._last_dispatched_prompt
+    if dispatched is None:
+        return
+    model_name, raw = dispatched
+    rc = engine.config.rc
+    if (
+        not rc.token_estimate_calibration_enabled
+        or raw <= 0
+        or model_name != engine.effective_model_name
+        or engine._token_estimate_calibration_model != model_name
+    ):
+        return
+    if exc.input_tokens is not None and exc.input_tokens > 0:
+        floor_tokens = exc.input_tokens
+    else:
+        window = exc.context_window or rc.model_context_window
+        output_cap = _context_overflow_rejected_wire_cap(engine, exc)
+        reserved = (
+            output_cap
+            if rc.provider_reserves_output_in_context_window and output_cap is not None
+            else 0
+        )
+        floor_tokens = window - reserved + 1
+    floor_factor = round(min(max(floor_tokens / raw, 1.0), 4.0), 3)
+    current = rc.token_estimate_calibration
+    if floor_factor <= current:
+        return
+    _logger.warning(
+        "DIAG request_budget.rejection_floor run=%s model=%s raw_estimate=%d "
+        "prompt_at_least=%d calibration=%.3f->%.3f",
+        engine.config.run_id,
+        model_name,
+        raw,
+        floor_tokens,
+        current,
+        floor_factor,
+    )
+    engine.set_token_estimate_calibration(floor_factor, model_name=model_name)
+
+
+async def _calibrate_near_compaction_trigger(engine: QueryEngine) -> None:
+    """Replace the gate's estimate with the provider's count when it is close.
+
+    The compaction gate decides on the calibrated estimate of the durable
+    history. Close to the trigger — within
+    :attr:`LoopConstants.exact_token_count_margin_ratio` of it — a provider that
+    can count a rendered request is asked for the history's real size, and the
+    factor is set from it, so the gate that runs next reads a number in the
+    provider's tokens. Far from the trigger, and on a provider without the
+    capability, nothing is sent and the gate is exactly what it was.
+    """
+    from protocore.runtime.context.budgets import derive_budgets
+
+    rc = engine.config.rc
+    if not rc.exact_token_count_enabled or not engine.history:
+        return
+    if engine._exact_count_model == engine.effective_model_name:
+        # The factor already comes from a count the fit made of this turn's
+        # full request, which is this history plus the system prompt and the
+        # tools. Counting the history alone as well would be a second
+        # round-trip per iteration for a figure the next fit refreshes anyway,
+        # and a request that has outgrown the window since is refused by that
+        # fit on its own count and sent to compaction.
+        return
+    estimate = engine.context_manager.current_prompt_tokens(engine.history)
+    if not near_limit(estimate, derive_budgets(rc).compaction_trigger_tokens, rc):
+        return
+    request = LLMRequest(model=engine.effective_model_name, messages=list(engine.history))
+    measured = await count_request_tokens_exactly(
+        request, engine.llm, rc, cache=engine._exact_token_counts, estimate=estimate
+    )
+    if measured is None:
+        return
+    _calibrate_token_estimate(engine, request, measured, exact=True)
+
+
+def _context_overflow_rejected_wire_cap(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> int | None:
+    rejected_max_tokens = engine._last_fitted_request_max_tokens
+    if rejected_max_tokens is None:
+        return None
+    if exc.requested_output_tokens is not None:
+        return min(rejected_max_tokens, exc.requested_output_tokens)
+    return rejected_max_tokens
+
+
+def _context_overflow_retry_cap(
+    engine: QueryEngine, exc: LLMContextWindowExceeded
+) -> int | None:
+    rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
+    if rejected_wire_cap is None:
+        return None
+    retry_max_tokens = int(
+        rejected_wire_cap * engine.config.rc.context_overflow_retry_output_ratio
+    )
+    if exc.context_window is not None and exc.input_tokens is not None:
+        provider_safe_output = (
+            exc.context_window
+            - exc.input_tokens
+            - engine.config.rc.request_context_safety_tokens
+        )
+        if provider_safe_output > 0:
+            retry_max_tokens = min(retry_max_tokens, provider_safe_output)
+    return retry_max_tokens
 
 
 async def _handle_context_window_exceeded(
     engine: QueryEngine,
     exc: LLMContextWindowExceeded,
 ) -> AsyncIterator[TurnEvent]:
-    """Recover from a context-window overflow — force_compaction once and
-    re-stream, else terminal.
+    """Recover with one compaction and bounded, strictly smaller output caps.
 
-    Tracked via ``engine._compaction_attempted_for_current_turn``: a second
-    overflow within the same message drives terminal FAILED.
+    Exact provider sizes may prove that one smaller request fits before history
+    is rewritten. Missing or lower-bound sizes cannot prove that, so recovery
+    compacts first. After compaction, every rejection may lower the cap again
+    until the configured attempt budget or the one-token floor is reached.
     """
-    if engine._compaction_attempted_for_current_turn:
-        # Already retried — go terminal LLM error.
-        # Death-spiral guard via _emit_llm_terminal.
-        async for evt in _emit_llm_terminal(engine, exc, kind="llm_context_window_exceeded"):
+    _calibrate_from_context_rejection(engine, exc)
+    retry_max_tokens = _context_overflow_retry_cap(engine, exc)
+    rejected_wire_cap = _context_overflow_rejected_wire_cap(engine, exc)
+    measured_retry_fits = (
+        exc.context_window is not None
+        and exc.input_tokens is not None
+        and retry_max_tokens is not None
+        and exc.input_tokens + retry_max_tokens <= exc.context_window
+    )
+    attempts_exhausted = (
+        engine._context_overflow_corrective_retry_count
+        >= engine.config.rc.context_overflow_retry_max_attempts
+    )
+    retry_strictly_shrinks = (
+        retry_max_tokens is not None
+        and rejected_wire_cap is not None
+        and retry_max_tokens >= 1
+        and retry_max_tokens < rejected_wire_cap
+    )
+
+    if (
+        engine._reactive_compaction_attempted_for_current_turn
+        and (attempts_exhausted or not retry_strictly_shrinks)
+    ):
+        async for evt in _emit_llm_terminal(
+            engine, exc, kind="llm_context_window_exceeded"
+        ):
             yield evt
         return
 
+    if (
+        retry_strictly_shrinks
+        and engine._context_overflow_corrective_retry_count == 0
+        and not engine._compaction_attempted_for_current_turn
+        and exc.requested_output_tokens is not None
+        and measured_retry_fits
+    ):
+        engine._context_overflow_retry_max_tokens = retry_max_tokens
+        engine._context_overflow_corrective_retry_count += 1
+        yield _emit_state_change(
+            engine,
+            engine.state,
+            engine.state,
+            reason="context_overflow_corrective_retry",
+        )
+        return
+
+    # Only a reactive pass counts here. A proactive pass carried into this
+    # message ran the routine profile, which leaves seeded history alone; the
+    # rejection is the evidence that the reactive profile is still owed.
+    if engine._reactive_compaction_attempted_for_current_turn:
+        retry_cap = cast(int, retry_max_tokens)
+        engine._context_overflow_retry_max_tokens = retry_cap
+        engine._context_overflow_corrective_retry_count += 1
+        yield _emit_state_change(
+            engine,
+            engine.state,
+            engine.state,
+            reason="context_overflow_corrective_retry",
+        )
+        return
+
+    if retry_strictly_shrinks:
+        engine._context_overflow_retry_max_tokens = retry_max_tokens
+        engine._context_overflow_corrective_retry_count += 1
+
     engine._compaction_attempted_for_current_turn = True
+    engine._reactive_compaction_attempted_for_current_turn = True
+    # A request has now been refused — by the provider, or by the local fit
+    # before it was sent: the evidence a suspended proactive gate was waiting
+    # for. Whatever this pass achieves, the history the gate sees next is
+    # judged afresh — and a no-gain backoff, whose reading predates the
+    # refusal, no longer holds either.
+    _lift_proactive_suspension(engine)
+    engine.compaction_backoff_left = 0
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")
@@ -5152,8 +5649,24 @@ async def _handle_context_window_exceeded(
                 call_purpose="structured",
                 call_category="compaction",
             ),
+            reactive=True,
         )
     except CompactionExhaustedError as inner_exc:
+        if retry_strictly_shrinks and not attempts_exhausted:
+            # History could not be rewritten any further, but the output cap
+            # can still shrink: the ladder is the remaining recovery, and the
+            # retry cap set above already names the next rung. Hand the turn
+            # back to it instead of ending the run on the compaction budget.
+            engine.last_observed_prompt_tokens = 0
+            compacting_from = engine.state
+            engine.transition_to(LoopState.RUNNING)
+            yield _emit_state_change(
+                engine,
+                compacting_from,
+                LoopState.RUNNING,
+                reason="reactive_413_compaction_exhausted_retry",
+            )
+            return
         # Death-spiral guard — set BEFORE the state transition.
         engine.skip_terminal_hooks = engine.config.rc.skip_terminal_hooks_on_llm_error
         compacting_from = engine.state
@@ -5197,9 +5710,8 @@ async def _handle_context_window_exceeded(
         },
     )
     # This path calls force_compaction directly (not via _run_compaction), so
-    # clear the stale prompt-size floor here too — the pre-compaction history it
-    # described no longer exists, and leaving it set would drive one spurious
-    # compaction at the next turn-start before the next LLM call self-heals it.
+    # clear the diagnostic scalar here too: it describes the request before
+    # history was rewritten, not the current prompt.
     engine.last_observed_prompt_tokens = 0
     await engine._persist_snapshot()
     compacting_from = engine.state
@@ -6612,6 +7124,46 @@ def _dispatch_outcome_is_terminal(
 # ---------------------------------------------------------------------------
 
 
+def _run_produced_output(engine: QueryEngine) -> bool:
+    """Whether the current run has anything a final answer could be about.
+
+    True once the model has written a word of prose or called a tool, or once a
+    tool result has come back. Thinking alone is not output: a run that spent a
+    round reasoning and then lost the endpoint has nothing to tell the user
+    about, and the reasoning is not shown to them anyway.
+
+    The run's own turns are the ones after the last message the CALLER put in —
+    the operator's prompt, or the tool result a parked run was resumed with.
+    That boundary is used rather than :func:`_this_run_messages` because the
+    seed tag that helper reads is set by the executor and not by every host: a
+    host that hands the engine a session's earlier turns verbatim would have
+    the predicate answer for a previous run. Anything after the last caller
+    message belongs to the round now driving, whoever assembled the history.
+
+    Asked by the provider-failure policy before it winds a run down. A
+    wind-down is a request for the best answer the evidence supports; put to a
+    run with no evidence it produces an invented one, which is worse than the
+    error it replaced. Pure / total — never raises.
+    """
+    start = 0
+    for index, message in enumerate(engine.history):
+        if message.role is MessageRole.user and not message.metadata.get(
+            SYNTHETIC_RECOVERY_METADATA_KEY
+        ):
+            start = index + 1
+    for message in engine.history[start:]:
+        if message.role is MessageRole.tool:
+            return True
+        if message.role is not MessageRole.assistant:
+            continue
+        for block in message.content_blocks:
+            if isinstance(block, ToolUseBlock):
+                return True
+            if isinstance(block, TextBlock) and block.text.strip():
+                return True
+    return False
+
+
 def _this_run_messages(engine: QueryEngine) -> list[Message]:
     """Messages that belong to THIS run, in history order.
 
@@ -6639,57 +7191,6 @@ def _this_run_messages(engine: QueryEngine) -> list[Message]:
         for message in engine.history
         if message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
     ]
-
-
-def _this_round_messages(engine: QueryEngine) -> list[Message]:
-    """The messages after the last one a caller put in, in history order.
-
-    The caller's message is the operator's prompt or steer, or the tool result a
-    parked run was resumed with; the runtime's own nudges are flagged
-    :data:`SYNTHETIC_RECOVERY_METADATA_KEY` and do not start a round. This
-    boundary is used rather than :func:`_this_run_messages` because the seed
-    tag that one reads is set by the executor and not by every host: a host that
-    hands the engine a session's earlier turns verbatim would have a run-scoped
-    predicate answer for a previous run. Anything after the last caller message
-    belongs to the round now driving, whoever assembled the history.
-    Pure / total — never raises.
-    """
-    start = 0
-    for index, message in enumerate(engine.history):
-        if message.role is MessageRole.user and not message.metadata.get(
-            SYNTHETIC_RECOVERY_METADATA_KEY
-        ):
-            start = index + 1
-    return engine.history[start:]
-
-
-def _run_produced_output(engine: QueryEngine) -> bool:
-    """Whether the current run has anything a final answer could be about.
-
-    True once the model has written a word of prose or called a tool, or once a
-    tool result has come back. Thinking alone is not output: a run that spent a
-    round reasoning and then lost the endpoint has nothing to tell the user
-    about, and the reasoning is not shown to them anyway.
-
-    The run's own turns are :func:`_this_round_messages`, so a previous run's
-    prose in an untagged history cannot answer for this one.
-
-    Asked by the provider-failure policy before it winds a run down. A
-    wind-down is a request for the best answer the evidence supports; put to a
-    run with no evidence it produces an invented one, which is worse than the
-    error it replaced. Pure / total — never raises.
-    """
-    for message in _this_round_messages(engine):
-        if message.role is MessageRole.tool:
-            return True
-        if message.role is not MessageRole.assistant:
-            continue
-        for block in message.content_blocks:
-            if isinstance(block, ToolUseBlock):
-                return True
-            if isinstance(block, TextBlock) and block.text.strip():
-                return True
-    return False
 
 
 # Universal terminal-tool nudge.
@@ -6825,6 +7326,12 @@ def _suppress_terminal_only_meta_text(engine: QueryEngine) -> bool:
  Pure / side-effect free; cheap enough to evaluate once per stream attempt.
  """
 
+    # A turn that forces the terminal call after a delivered answer can only
+    # carry that call. Whatever text a provider lets through on it is not an
+    # answer, whatever the terminal tool's schema — a message-carrying tool
+    # takes its answer in its arguments — so none of it reaches the reader.
+    if _forced_terminal.request_mode(engine) is not None:
+        return True
     if not getattr(engine, "_terminal_only_active", False):
         return False
     terminal_tool = _resolved_terminal_tool_name(engine)
@@ -6881,6 +7388,24 @@ def _apply_terminal_synthesis_output_reserve(
         return max_output_tokens
     floor = min(reserve, output_cap)
     return max(max_output_tokens, floor)
+
+
+def _apply_context_overflow_retry_output_cap(
+    engine: QueryEngine, max_output_tokens: int
+) -> int:
+    """Reduce output headroom during bounded context-overflow recovery.
+
+    A provider may count framing that the local estimator cannot see. The
+    per-message recovery state distinguishes smaller requests from ordinary
+    calls and bounds their count. Applying the cap after terminal synthesis
+    reservation ensures no later floor restores the rejected output allowance;
+    the hard request fit still runs afterwards.
+    """
+
+    retry_max_tokens = engine._context_overflow_retry_max_tokens
+    if retry_max_tokens is None:
+        return max_output_tokens
+    return min(max_output_tokens, retry_max_tokens)
 
 
 def _history_has_file_write_result(engine: QueryEngine) -> bool:
@@ -7307,22 +7832,35 @@ def _is_terminal_tool_name(name: object, terminal_tool: str) -> bool:
     return isinstance(name, str) and _strip_tool_name_prefix(name) == terminal_tool
 
 
-def _is_non_terminal_tool_activity(block: object, terminal_tool: str) -> bool:
+def _is_non_terminal_tool_activity(
+    block: object,
+    terminal_tool: str,
+    call_names: Mapping[str, str] | None = None,
+) -> bool:
     """True for tool activity that is real work, NOT the terminal gate.
 
     Ported from the host ``_is_non_finalize_tool_activity`` but keyed on
     the configured ``terminal_tool``:
 
       * a ``ToolUseBlock`` is real work unless it is the terminal tool;
-      * a ``ToolResultBlock`` is real work unless its named tool is the terminal
-        tool, OR (when unnamed) it carries the terminal-metadata flag — an
-        unnamed successful terminal result is still the gate, not user work.
+      * a ``ToolResultBlock`` is real work unless its tool is the terminal
+        tool — named on the result, or resolved through ``call_names`` from
+        the call it answers — OR (when neither names it) it carries the
+        terminal-metadata flag: an unnamed successful terminal result is still
+        the gate, not user work.
+
+    The resolution through the call matters for a terminal call that FAILED.
+    Its result carries no terminal flag, and read as work it would move the
+    answer behind it — so the answer the call was sealing would stop counting
+    as an answer, and the next terminal call would be refused for want of one.
     """
 
     if isinstance(block, ToolUseBlock):
         return not _is_terminal_tool_name(block.name, terminal_tool)
     if isinstance(block, ToolResultBlock):
         tool_name = block.metadata.get("tool_name")
+        if not isinstance(tool_name, str) and call_names is not None:
+            tool_name = call_names.get(block.tool_call_id)
         if isinstance(tool_name, str):
             return not _is_terminal_tool_name(tool_name, terminal_tool)
         # A successful terminal result without a name is still the terminal
@@ -7330,6 +7868,27 @@ def _is_non_terminal_tool_activity(block: object, terminal_tool: str) -> bool:
         # handled above; unnamed non-terminal results remain visible work.
         return block.metadata.get(TERMINAL_TOOL_METADATA_KEY) is not True
     return False
+
+
+#: Corrective turns a gate appends when it REFUSES the terminal call because
+#: the answer before it is not the answer. Each closes the answer window the
+#: way work does: prose written before it was refused, and only prose written
+#: after it can count as the run's answer.
+_ANSWER_REFUSAL_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
+        SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
+    }
+)
+
+
+def _refuses_answer(message: Message) -> bool:
+    """True iff ``message`` is a gate's corrective turn refusing the answer."""
+    return (
+        message.role is MessageRole.user
+        and message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        in _ANSWER_REFUSAL_KINDS
+    )
 
 
 def _has_visible_assistant_prose_after_work(
@@ -7368,9 +7927,13 @@ def _has_visible_assistant_prose_after_work(
     # A floor of 0 means "any non-empty visible prose counts" (so we still
     # require at least 1 stripped char); a positive floor demands that many.
     substantive_floor = max(1, min_chars)
-    for message in _this_run_messages(engine):
+    run_messages = _this_run_messages(engine)
+    call_names = tool_names_by_call_id(run_messages)
+    for message in run_messages:
+        if _refuses_answer(message):
+            last_work_pos = pos
         for block in message.content_blocks:
-            if _is_non_terminal_tool_activity(block, terminal_tool):
+            if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 last_work_pos = pos
             if (
                 message.role is MessageRole.assistant
@@ -7400,26 +7963,6 @@ def _preserve_completed_answer_on_stream_error(engine: QueryEngine) -> bool:
 
     rc = engine.config.rc
     if not getattr(rc, "preserve_completed_answer_on_stream_error", False):
-        return False
-    # The answer must have been written in the round that failed. The prose
-    # check below reads :func:`_this_run_messages`, which trusts the seed tag,
-    # and a host that hands over the session's earlier turns untagged made the
-    # PREVIOUS run's reply count: a run whose provider refused every request
-    # completed "on its preserved answer" having written nothing, and the
-    # operator was shown no reply and no error. The round boundary does not
-    # depend on the tag. With an answer in the round, the latest substantive
-    # prose is that answer, so the prose check still decides whether work came
-    # after it.
-    floor = max(1, rc.finalize_prose_gate_min_chars)
-    answered_in_round = any(
-        isinstance(block, TextBlock) and len(block.text.strip()) >= floor
-        for message in _this_round_messages(engine)
-        if message.role is MessageRole.assistant
-        and not message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-        and message.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is not True
-        for block in message.content_blocks
-    )
-    if not answered_in_round:
         return False
     return _has_visible_assistant_prose_after_work(
         engine,
@@ -7454,6 +7997,44 @@ async def _complete_run_on_preserved_answer(
         },
     )
     engine.transition_to(LoopState.COMPLETED)
+
+
+def _transient_retry_permitted(engine: QueryEngine) -> bool:
+    """Whether another attempt at the same endpoint is still allowed to start.
+
+    A retry costs wall-clock time the run may not have. Two things withdraw
+    that permission: a stop the caller asked for, and a wall-clock budget
+    already at its finalisation threshold — sleeping through a backoff and
+    re-opening a stream past either is work nobody is waiting for. The bound on
+    the NUMBER of attempts is the policy's own; this is about whether the run
+    is still running at all. Pure / total — never raises.
+    """
+    return not engine.stop_requested and not _terminal_deadline_reached(engine)
+
+
+async def _await_transient_retry_backoff(
+    engine: QueryEngine, seconds: float
+) -> None:
+    """Wait out a retry backoff, cut short by a stop.
+
+    The pause is the one place a failing run holds still for whole seconds, so
+    it waits on the stop event rather than on the clock: a cancel that lands
+    mid-backoff ends the wait immediately and the loop's next cancel checkpoint
+    routes the run to its cancelled terminal, instead of the cancel being
+    noticed a backoff later. It is also clamped to whatever remains of the
+    run's wall-clock budget, so the wait cannot itself be what spends it.
+    """
+    if seconds <= 0.0:
+        return
+    budget = engine.config.rc.agent_max_seconds
+    started = getattr(engine, "_run_started_monotonic", 0.0)
+    if budget > 0.0 and started != 0.0:
+        left = budget - (time.monotonic() - started)
+        seconds = min(seconds, left)
+        if seconds <= 0.0:
+            return
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(engine._stop_requested.wait(), timeout=seconds)
 
 
 def _transient_retry_backoff_seconds(
@@ -7908,6 +8489,10 @@ def _plain_stop_answer_floor_applies(engine: QueryEngine) -> bool:
 def _run_did_non_terminal_work(engine: QueryEngine, terminal_tool: str) -> bool:
     """True iff this run called at least one non-terminal tool.
 
+    A gate's corrective that refused the terminal call counts too, as the
+    refused call's error result once did: the run owes a report on something,
+    and the prose it was refused for was not it.
+
     The floor is a length test, and a length test cannot by itself tell a reply
     that COLLAPSED from one that is correctly brief. What separates them is
     whether there was anything to report: a run that searched, delegated or
@@ -7923,9 +8508,13 @@ def _run_did_non_terminal_work(engine: QueryEngine, terminal_tool: str) -> bool:
     left in history.
     """
 
-    for message in _this_run_messages(engine):
+    run_messages = _this_run_messages(engine)
+    call_names = tool_names_by_call_id(run_messages)
+    for message in run_messages:
+        if _refuses_answer(message):
+            return True
         for block in message.content_blocks:
-            if _is_non_terminal_tool_activity(block, terminal_tool):
+            if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 return True
     return False
 
@@ -8029,13 +8618,18 @@ def _visible_answer_after_work(engine: QueryEngine, terminal_tool: str) -> str:
     """
 
     answer_parts: list[str] = []
-    for message in _this_run_messages(engine):
+    run_messages = _this_run_messages(engine)
+    call_names = tool_names_by_call_id(run_messages)
+    for message in run_messages:
         scaffolding = bool(message.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY))
         partial_attempt = (
             message.metadata.get(PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY) is True
         )
+        if _refuses_answer(message):
+            answer_parts.clear()
+            continue
         for block in message.content_blocks:
-            if _is_non_terminal_tool_activity(block, terminal_tool):
+            if _is_non_terminal_tool_activity(block, terminal_tool, call_names):
                 # Work landed — everything said before it was narration about
                 # work in progress, not the report on it.
                 answer_parts.clear()
@@ -8403,6 +8997,235 @@ def _resolve_pre_dispatch_terminal_veto(
     if not corrective:
         return None
     return corrective
+
+
+def _forcing_this_request(engine: object) -> bool:
+    """True iff the request that just came back was a forced terminal request."""
+    return _forced_terminal.request_mode(engine) is not None
+
+
+def _terminal_answer_delivered(engine: QueryEngine) -> bool:
+    """True iff this run's answer is written and only its terminal call is owed.
+
+    The answer is the model's visible prose after its latest real work, held to
+    the same floor the prose gate uses, so the call forced on the strength of
+    this predicate is one the prose gate lets through.
+    """
+    terminal_tool = _resolved_terminal_tool_name(engine)
+    if terminal_tool is None:
+        return False
+    return _has_visible_assistant_prose_after_work(
+        engine, terminal_tool, engine.config.rc.finalize_prose_gate_min_chars
+    )
+
+
+def _terminal_tool_registered(engine: QueryEngine) -> bool:
+    """True iff the run's terminal tool is a tool this run can still call.
+
+    Registered, and not stopped by the consecutive-error circuit breaker: a
+    tool the breaker took off the surface for the rest of the run is one no
+    forced request can reach, and the breaker's corrective asks the model for
+    something the forcing would then have to step aside for.
+    """
+    terminal_tool = _resolved_terminal_tool_name(engine)
+    if terminal_tool is None:
+        return False
+    if any(
+        _is_terminal_tool_name(name, terminal_tool)
+        for name in engine._circuit_broken_tools
+    ):
+        return False
+    getter = getattr(getattr(engine, "tools", None), "get", None)
+    return getter is not None and getter(terminal_tool) is not None
+
+
+def _arm_forced_terminal_call(engine: QueryEngine) -> bool:
+    """Start forcing the terminal call; the terminal-only latch goes with it.
+
+    The latch is what floors the output budget for a final turn and keeps the
+    turn's stray text out of the transcript, and a forced terminal turn is the
+    final turn. Nothing is appended: the forced ``tool_choice`` is the whole
+    instruction.
+    """
+    engine._terminal_only_active = True
+    return _forced_terminal.arm(engine)
+
+
+def _release_forced_terminal_call(engine: QueryEngine) -> None:
+    """Lift the forcing; the terminal-only latch goes back to the wind-down's.
+
+    The latch hides a turn's text as narration after an answer. A lifted
+    forcing hands the model a turn in which it is asked to act — a corrective
+    to answer, work to resume — and what it writes there is not narration.
+    """
+    _forced_terminal.release(engine, reason=_forced_terminal.REASON_RELEASED)
+    engine._terminal_only_active = _soft_stop.is_armed(engine)
+
+
+def _trailing_tool_results(engine: QueryEngine) -> list[ToolResultBlock]:
+    """The tool results after the latest assistant turn, in history order."""
+    results: list[ToolResultBlock] = []
+    for message in reversed(_this_run_messages(engine)):
+        if message.role is MessageRole.assistant:
+            break
+        if message.role is not MessageRole.tool:
+            return []
+        results[:0] = [
+            block
+            for block in message.content_blocks
+            if isinstance(block, ToolResultBlock)
+        ]
+    return results
+
+
+def _forced_terminal_question_pending(engine: QueryEngine) -> bool:
+    """True iff the transcript ends in a message asking the model something.
+
+    Nothing the forcing does appends to the transcript, so a user-role message
+    at its end came from elsewhere: a gate's corrective after it refused the
+    call, a message the user sent meanwhile, a background result. A forced
+    call can answer none of them. The wind-down's notice is the exception — it
+    asks for the answer and the terminal call, which the run has and is making.
+    """
+    run_messages = _this_run_messages(engine)
+    if not run_messages:
+        return False
+    last = run_messages[-1]
+    return (
+        last.role is MessageRole.user
+        and last.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
+        != _soft_stop.SYNTHETIC_RECOVERY_SOFT_STOP
+    )
+
+
+def _forced_terminal_working_again(engine: QueryEngine) -> bool:
+    """True iff the last forced turn called a tool other than the terminal one."""
+    terminal_tool = _resolved_terminal_tool_name(engine) or ""
+    return any(
+        not _is_terminal_tool_name(
+            _tool_name_for_call_id(engine, block.tool_call_id), terminal_tool
+        )
+        for block in _trailing_tool_results(engine)
+    )
+
+
+def _is_needs_work_refusal(
+    block: ToolResultBlock, terminal_tool: str, call_names: Mapping[str, str]
+) -> bool:
+    return (
+        block.is_error
+        and block.metadata.get(TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY) is True
+        and _is_terminal_tool_name(call_names.get(block.tool_call_id), terminal_tool)
+    )
+
+
+def _forced_terminal_work_requested(engine: QueryEngine) -> bool:
+    """True iff the terminal tool refused its last call for missing work.
+
+    Only a refusal marked with :data:`TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY`
+    counts, and only the run's FIRST such refusal. An argument or validation
+    error is fixed by calling the terminal tool again, which forcing it by name
+    lets the model do; and each turn of work ends in prose the reader sees, so
+    a tool that keeps refusing for missing work gets one turn of it and is then
+    forced by name like any other refusal.
+    """
+    terminal_tool = _resolved_terminal_tool_name(engine) or ""
+    run_messages = _this_run_messages(engine)
+    call_names = tool_names_by_call_id(run_messages)
+    if not any(
+        _is_needs_work_refusal(block, terminal_tool, call_names)
+        for block in _trailing_tool_results(engine)
+    ):
+        return False
+    refusals = sum(
+        1
+        for message in run_messages
+        for block in message.content_blocks
+        if isinstance(block, ToolResultBlock)
+        and _is_needs_work_refusal(block, terminal_tool, call_names)
+    )
+    return refusals == 1
+
+
+def _forced_terminal_write_first_before_sealing(engine: QueryEngine) -> bool:
+    """True iff the write-first telling takes priority over sealing the answer.
+
+    Only when the host switched it on and the telling would actually say
+    something: write-first is enabled, one of the write tools is a tool this
+    run has, and the run has written nothing with any of them yet.
+    """
+    rc = engine.config.rc
+    if not (
+        rc.terminal_tool_nudge_write_first_before_forcing
+        and rc.terminal_tool_nudge_write_first_enabled
+    ):
+        return False
+    getter = getattr(getattr(engine, "tools", None), "get", None)
+    if getter is None or not any(
+        getter(name) is not None for name in rc.terminal_tool_nudge_file_write_tool_names
+    ):
+        return False
+    return not _history_has_file_write_result(engine)
+
+
+def _forced_terminal_slot_taken(engine: QueryEngine) -> bool:
+    """True iff a run-level precondition owns the next request's forced slot."""
+    return _preconditions.outstanding_tool(engine) is not None
+
+
+def _forced_terminal_admits(engine: QueryEngine, tool_name: str) -> bool:
+    """Whether a call to ``tool_name`` may leave a forced turn.
+
+    A provider may ignore the forced ``tool_choice``, and a fallback endpoint
+    may not support it at all. What such a turn returns beyond what its mode
+    admits is dropped before it is recorded or run, so the constraint holds
+    whether or not the provider kept it.
+    """
+    mode = _forced_terminal.request_mode(engine)
+    if mode is None or mode == _forced_terminal.MODE_ANY_TOOL:
+        return True
+    return _is_terminal_tool_name(tool_name, _resolved_terminal_tool_name(engine) or "")
+
+
+def _drop_calls_a_forced_turn_does_not_admit(
+    engine: QueryEngine, calls: list[ToolCall]
+) -> list[ToolCall]:
+    kept = [call for call in calls if _forced_terminal_admits(engine, call.name)]
+    if len(kept) != len(calls):
+        _logger.warning(
+            "DIAG forced_terminal.dropped_calls run=%s mode=%s dropped=%s",
+            engine.config.run_id,
+            _forced_terminal.request_mode(engine),
+            ",".join(call.name for call in calls if call not in kept),
+        )
+    return kept
+
+
+async def _complete_on_delivered_answer(
+    engine: QueryEngine, reason: str
+) -> AsyncIterator[TurnEvent]:
+    """Complete the run on the answer it delivered, without the terminal call.
+
+    The same closing events a voluntary finish has — a wind-down that is
+    running is marked finalised and named on the ``message_stop`` — preceded by
+    the state change that says why the terminal tool was never called. It is a
+    hard stop rather than a voluntary finish: the finish seams (the answer
+    floor, a voluntary artifact seal) and follow-up placement are not passed,
+    because each of them can open another request, and another request under a
+    delivered answer is what the forcing exists to prevent.
+    """
+    _logger.warning(
+        "DIAG forced_terminal.complete run=%s reason=%s attempts=%d: completing "
+        "on the delivered answer without the terminal call",
+        engine.config.run_id,
+        reason,
+        _forced_terminal.attempts_spent(engine),
+    )
+    _release_forced_terminal_call(engine)
+    yield _emit_state_change(engine, engine.state, engine.state, reason=reason)
+    async for event in _emit_voluntary_completion(engine):
+        yield event
+    engine.transition_to(LoopState.COMPLETED)
 
 
 def _append_terminal_tool_nudge(engine: QueryEngine) -> None:
@@ -8973,7 +9796,7 @@ async def _maybe_drive_longfile_convergence(
     # effects so the deadline path can drive the model to its
     # ``expected_terminal_tool`` and complete. Stall clock still advances
     # below so the bookkeeping is honest.
-    if _terminal_only_enforced(engine):
+    if _terminal_only_enforced(engine) or _forced_terminal.is_armed(engine):
         _longfile.register_completed_turn(engine)
         _logger.warning(
             "DIAG query.longfile_convergence.skipped_terminal_only run=%s "
@@ -11942,6 +12765,11 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
                 charge=_charge_empty_round,
                 reset=_reset_empty_rounds,
             ),
+            reasoning_cut_rounds=RunCounter(
+                read=_reasoning_cut_rounds_spent,
+                charge=_charge_reasoning_cut_round,
+                reset=_reset_reasoning_cut_rounds,
+            ),
             post_tool_nudges=RunCounter(
                 read=_post_tool_nudges_spent,
                 charge=_charge_post_tool_nudge,
@@ -11950,14 +12778,15 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             append_continue_prompt=_append_thinking_continue_prompt,
             append_post_tool_nudge=_append_post_tool_empty_nudge,
             continue_prompt_event=_policy_continue_prompt_event,
-            cut_step=_step_reasoning_after_cut,
-            cut_restore=_restore_reasoning_after_cut,
-            append_cut_nudge=_append_reasoning_cut_nudge,
-            cut_retry_event=_policy_reasoning_cut_event,
+            reasoning_cut_step=_step_reasoning_after_cut,
+            reasoning_cut_restore=_restore_reasoning_after_cut,
+            append_reasoning_cut_nudge=_append_reasoning_cut_nudge,
+            reasoning_cut_event=_policy_reasoning_cut_event,
             enter_wind_down=_enter_soft_stop,
             wind_down_budget=_soft_stop_turn_budget,
             llm_terminal=_emit_llm_terminal,
             state_change=_policy_state_change,
+            forcing_terminal_call=_forcing_this_request,
         ),
         EmptyCompletionGuardPolicy(
             has_terminal_tool_result=_history_has_terminal_tool_result,
@@ -11972,13 +12801,28 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
         PerIterationCompactionPolicy(
             compact=_run_compaction,
             protect_index=current_tool_batch_protect_index,
-            pair_orphans=_policy_pair_orphan_tool_calls,
-            message_stop=_policy_message_stop,
+            prompt_tokens=_current_prompt_tokens,
         ),
         TerminalNudgePolicy(
             required=_terminal_tool_nudge_required,
             append=_append_terminal_tool_nudge,
             state_change=_policy_state_change,
+            forced=ForcedTerminalCall(
+                answer_delivered=_terminal_answer_delivered,
+                tool_registered=_terminal_tool_registered,
+                arm=_arm_forced_terminal_call,
+                armed=_forced_terminal.is_armed,
+                release=_release_forced_terminal_call,
+                question_pending=_forced_terminal_question_pending,
+                working_again=_forced_terminal_working_again,
+                work_requested=_forced_terminal_work_requested,
+                write_first_before_sealing=_forced_terminal_write_first_before_sealing,
+                slot_taken=_forced_terminal_slot_taken,
+                charge=_forced_terminal.charge_attempt,
+                set_mode=_forced_terminal.set_request_mode,
+                exhausted=_forced_terminal.exhausted,
+                complete=_complete_on_delivered_answer,
+            ),
         ),
         CancellationPolicy(teardown=_emit_dispatch_cancel_teardown),
         OutputCapRecoveryPolicy(
@@ -12035,12 +12879,15 @@ _CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
             retry_event=_policy_transient_retry_event,
             commit_usage=_policy_commit_usage,
             backoff=_transient_retry_backoff_seconds,
+            may_retry=_transient_retry_permitted,
+            await_backoff=_await_transient_retry_backoff,
             retries=RunCounter(
                 read=_transient_retries_spent,
                 charge=_charge_transient_retry,
                 reset=_reset_transient_retries,
             ),
             log_crash=_policy_log_stream_crash,
+            log_failure=_policy_log_stream_failure,
         ),
         TruncatedToolCallRecoveryPolicy(
             recoveries=RunCounter(

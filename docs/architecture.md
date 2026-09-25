@@ -334,7 +334,7 @@ governing `LoopConstants` field(s) and their safe/off default.
 | Failure classification | `contracts/resilience.py::IResilienceClassifier`, `runtime/error_kinds.py` | none — the classifier is `QueryEngineConfig.resilience_classifier`; unbound means no wording is recognised | Yes | Yes |
 | Run wind-down (soft stop) | `runtime/soft_stop.py` | `soft_stop_enabled` = `True`, `soft_stop_max_turns` = `3` | Yes | Yes |
 | Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, host-owned band | band wired via per-call output budget | Yes | Yes |
-| Finalization gate + contract | host-owned | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
+| Finalization gate + contract | host-owned | `terminal_tool_nudge_enabled` (`False`), `terminal_tool_forced_max_attempts`, `terminal_tool_forced_thinking_enabled`, `terminal_tool_nudge_write_first_before_forcing`, `finalize_prose_gate_enabled` | Yes | Yes |
 | Terminal-answer validation + references/grounding | host-owned (the core carries the evidence a run collects, `contracts/evidence.py`) | host knobs (validation and reference normalisation are both driven from the host's own model) | Yes | Yes |
 | IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
 | Token counting | `runtime/token_counting.py` (+ the optional `protocore-native` estimator) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` forces the pure-Python path | Yes | Yes |
@@ -467,6 +467,13 @@ crashes. The shared assistant loop is **not** a single immutable path:
   (`commit_usage`, `fire_lifecycle`, `mark_intent_recovery`,
   `persist_correctness`). Those older recovery branches remain model-agnostic
   and RC-gated.
+
+  Context-window recovery preserves at most one compaction per assistant
+  message. An exact provider prompt count can justify one smaller-cap retry
+  before compaction. A missing or lower-bound count compacts first; subsequent
+  rejections repeatedly reduce the rejected wire cap by
+  `context_overflow_retry_output_ratio`, always strictly, and stop after
+  `context_overflow_retry_max_attempts` or when no smaller positive cap exists.
 - `runtime/loop_strategies.py` — `select_strategy(run_mode)` is the single
   branch point. `DirectStrategy` contributes no pre-action step (the
   auto-tool loop). `DeepStrategy` runs a forced planning tool
@@ -480,12 +487,71 @@ crashes. The shared assistant loop is **not** a single immutable path:
   three things those four used to settle separately — the model in force (the
   live override when one is set), the forced tool (one slot,
   `extra["forced_tool_choice"]`, carrying the tool NAME for an adapter to
-  render onto its own wire) and the temperature (stated on every request).
+  render onto its own wire; or, instead, `extra["tool_choice_required"] =
+  True`, meaning "some tool, no prose", rendered as `tool_choice="required"`;
+  an adapter without support ignores either — see `LLMRequest.extra`) and the
+  temperature (the caller's value, or
+  `None` so the host decides — a per-model setting or the server's own
+  generation config; the summarisers state theirs).
+- `runtime/context/budgets.py` — `derive_budgets` turns one RC snapshot into
+  every per-layer token budget, deterministically, with no cache. The
+  compaction trigger it returns is the LOWER of two bounds: the configured
+  `compaction_trigger_ratio` of the window, and the largest prompt the
+  provider would still accept — the window less the output reserve, less
+  `request_context_safety_tokens`, less `compaction_trigger_turn_headroom_ratio`
+  of the window for the turn that is about to be added. A serving stack that
+  counts the requested output against the same window as the prompt rejects
+  anything above `window - max output`, so a trigger derived from the ratio
+  alone can sit above the cliff and never fire: on a 65 536-token window with
+  the stock 0.25 output reserve, 0.8 of the window is 3 276 tokens past the
+  point the request stops being accepted. The output-reserve term is gated on
+  `provider_reserves_output_in_context_window`, true by default — an endpoint
+  that sizes its input window independently of the requested output sets it
+  false and gets that share of the window back. Consumers read the effective
+  value; the emergency cliff is held strictly above it.
+- `runtime/request_budget.py` — fits every assembled request to the hard
+  window by clipping its output cap. The size it fits to is the calibrated
+  estimate, except near the edge: once the estimate reaches
+  `exact_token_count_margin_ratio` of the prompt size at which the cap starts
+  being clipped, a provider that implements the optional
+  `IRequestTokenCounter` capability is asked what the request renders to, and
+  that count is used instead. The same question is asked of the durable history
+  when it is within the margin of the compaction trigger, so the gate decides
+  on the provider's tokens — until a fit has counted the turn's full request,
+  after which the gate reads the factor that count set instead of paying a
+  second round-trip. After the first count the fit asks again only when the
+  last count plus the content that count did not see — every message whose
+  digest is not among the counted ones, so a message rewritten by compaction
+  or eviction is new, and removals are ignored — sized at the worst undercount
+  the margin assumes (`1 / (1 - margin)`), could cross the limit, so prose-heavy
+  turns count about once near the edge while a large dense tool result is
+  counted at once. A count that fails or times out stops counting for
+  `exact_token_count_failure_backoff_seconds`. The default margin, 0.75, is `1 - 1/4`: an undercount by
+  a factor `f` is only caught when the margin is at least `1 - 1/f`, the
+  heuristic was measured running 1.76x short on JSON and 3.53x on hexadecimal
+  text, and 4 is the largest factor calibration can express. An exact count
+  sets `token_estimate_calibration` outright, and does so before the fit is
+  attempted, so a count that proves the request cannot fit raises the factor
+  first and the refusal goes to compaction sized in the counted tokens; a usage
+  report after the call moves it half-way; a rejection for length raises it to
+  the floor the rejection proves (the prompt was at least the window less the
+  output cap the loop sent). Counts are kept per request content
+  (`exact_token_count_cache_max_entries`); a count that fails or does not
+  arrive within `exact_token_count_timeout_seconds` is logged and the estimate
+  is used; a provider without the capability sends exactly the requests it
+  sent before. Each fresh count logs the estimate beside the measurement,
+  which is the drift between the two. The learned factor lives in the run's
+  snapshot and survives a resume on the same model; a new run starts from the
+  configured `token_estimate_calibration`, so a host that knows its content
+  runs dense seeds that value per scope.
 - `runtime/context/compaction.py` — three passes over the transcript, in
   order, each one taking what the pass before it could not.
   **Tier 1** replaces an over-budget tool result with a placeholder and puts
   the bytes in the blob store; the content is recoverable and the preview says
-  what was shed. **Tier 2** summarises old turns through the compaction LLM —
+  what was shed. It may also shed aged reasoning or an over-budget frozen
+  reference while preserving message metadata, including seed provenance.
+  Routine **Tier 2** and **Tier 3** leave seeded prior-run turns untouched.
+  **Tier 2** summarises old turns through the compaction LLM —
   one atomic unit at a time, an assistant `tool_use` turn and the results
   answering it standing or falling together so no pair is orphaned. It never
   summarises a turn the operator wrote: an instruction is short, so
@@ -499,16 +565,25 @@ crashes. The shared assistant loop is **not** a single immutable path:
   becomes one consolidated summary in which the operator's instructions
   survive as exact quotes; the task turn and the
   `compaction_fold_keep_operator_turns` most recent instructions stay
-  verbatim, and a seeded prior-run turn is never folded (the fold would drop
-  the tag that separates the runs). A fold is a summary like any other, so a
-  later fold absorbs it once its neighbourhood has grown again.
+  verbatim. Reactive provider-overflow recovery may summarise and fold seed-only spans,
+  keeping only the `compaction_force_keep_recent_turns` trailing messages (one by
+  default); every replacement retains the seed tag and
+  spans split at seed/current boundaries, so the host's persistence filter
+  keeps the runs separate. Frozen compaction references remain protected. A
+  fold is a summary like any other, so a later fold absorbs it once its
+  neighbourhood has grown again.
 
   Both summarisers assemble their request through `build_llm_request`, record
   it to the request manifest, and are told the same two rules the wording of a
   summary lives or dies by: keep every identifier — paths, ids, ports, URLs,
   numbers, error codes — verbatim rather than substituting a plausible value,
   and state an outcome with no tool result or confirmation behind it as
-  UNKNOWN rather than as done or not done. Both instructions are templates
+  UNKNOWN rather than as done or not done. The per-turn prompt states its
+  budget in characters as well as words, says a longer reply is cut off and
+  discarded, asks for the count and the records that matter instead of a copy
+  of a long tool result, and names the single key it wants — a model that
+  listed every record of a long result wrote a reply the output cap cut, and a
+  cut reply is never parsed. Both instructions are templates
   (`compaction_turn_summary`, `compaction_fold_summary`), not literals, so an
   operator serving another language has somewhere to put the translation.
 
@@ -516,11 +591,97 @@ crashes. The shared assistant loop is **not** a single immutable path:
   `compaction_summary_min_unit_tokens` is not sent at all (a summariser writes
   a sentence or three whatever it is handed, so below some size the call is
   spent to discover the summary is no smaller), the word budget in the prompt
-  scales with the unit rather than being a fixed sentence count, calls go out
+  scales with the unit rather than being a fixed sentence count and is capped
+  at what the output cap can hold at
+  `compaction_summary_output_tokens_per_word` (four — the English figure of two
+  understates JSON escaping and a non-Latin script, and a budget sized that way
+  comes back cut off, never parses and is never committed) less
+  `compaction_summary_envelope_tokens` for the JSON around the words, and never
+  above what the grammar's own `maxLength` will accept, calls go out
   `compaction_summariser_parallelism` at a time instead of one after another
   while the run sits in `COMPACTING`, and the fold takes at most
   `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
   back no smaller than what it would replace is discarded, never committed.
+
+  A call that fails for a reason belonging to the unit — the request does not
+  fit the summariser's own window, or the reply carried no readable summary
+  because the output cap cut the envelope — is counted against THAT unit in
+  `CompactionState.failed_anchor_keys`, and past
+  `compaction_summary_failed_unit_max_attempts` the routine gate stops sending
+  it; the fold tier still gets its turn at it. Nothing else is counted: a
+  transport failure (a rate limit, a 5xx, a recycled summariser) says nothing
+  about the unit, and neither does a summary that merely came back no smaller,
+  so neither retires anything. The other units in the batch commit regardless,
+  so one unit the summariser cannot handle no longer keeps a pass from shedding
+  anything. The forced passes ignore the census and try every unit — they run
+  when the alternative is the run ending. The census rides the run snapshot,
+  and entries whose unit has left the transcript are pruned at the end of every
+  pass, so it does not grow without bound.
+
+  Separately from the census, a pass is charged to a retry budget bounded by
+  `compaction_failed_max_retries`. Only a pass that tried and failed is charged
+  — a tier raised, or a summariser call was made and nothing came of it — and
+  it is charged once, however many tiers failed. Routine and proactive passes
+  share `CompactionState.retry_count`; the reactive pass after a provider
+  rejection keeps `CompactionState.reactive_retry_count`, because it is the
+  only profile that may compact seeded history and proactive failures prove
+  nothing about it. Progress by either profile clears both counters, since the
+  next pass of either kind faces a different history, and `rearm()` clears
+  them too. A transport failure therefore costs the pass one retry and the
+  unit nothing, while a unit-shaped failure is counted against the unit as
+  well; the forced passes ignore the census either way. Both counters ride the
+  run snapshot.
+
+  A proactive pass (routine, turn-start emergency, per-iteration) is decided
+  before it opens. `ContextManager.has_proactive_work` asks each tier whether
+  it would change anything under the proactive profile, without changing it;
+  when none would — a history of seeded turns is the usual case — the gate
+  opens no transaction at all: no `COMPACTING`, no events, hooks, usage row or
+  snapshot. The engine remembers that probe with the history and the constants
+  it saw, and does not ask again until either changes. Past the budget, a
+  proactive pass does not end the run: nothing has been rejected yet, so the
+  proactive summariser tiers are suspended (a
+  `compaction_exhausted_proactive_suspended` state change each time a
+  proactive pass exhausts the budget; `retry_count` is not reset, so after the
+  suspension one failed pass suspends again) and the request goes out. Tier 1 needs no LLM and keeps running through the suspension. The
+  suspension ends after `compaction_proactive_suspension_iterations` gate
+  visits, or once the prompt has grown by
+  `compaction_proactive_suspension_growth_ratio` of its size when it began,
+  whichever comes first. A context refusal lifts it at once — the provider's,
+  or the local fit's refusal by estimate or exact count, both of which run the
+  reactive pass — and so do `rearm()` and a resume from a snapshot, which does
+  not carry it. A reactive pass past its budget hands the turn to the
+  output-cap ladder while a smaller cap is left, and fails the run only when
+  none is.
+
+  The routine per-iteration gate also stands down for
+  `compaction_no_gain_backoff_iterations` iterations after a pass that freed
+  less than `compaction_min_gain_ratio`; the count survives the per-message
+  recovery reset, which used to clear it before it could skip anything. The
+  backoff ends early once the prompt has grown by
+  `compaction_no_gain_backoff_growth_ratio` of its size when it was set, and on
+  any context refusal.
+
+- `runtime/stale_result_trim.py` — the prompt-shrinking pass that costs no LLM
+  call. RC-gated by `tool_result_stale_trim_enabled` (**off by default**), it
+  rewrites the REQUEST view only — `engine.history` keeps every byte, so
+  persistence, replay and compaction see an untouched transcript. A tool result
+  longer than `tool_result_stale_max_chars` is cut to that head once the run has
+  moved past it; the newest `tool_result_fresh_count` results and every result
+  of the latest round of tool calls are never touched, whatever their size,
+  because that is what the model is about to read. Nothing is cut until the
+  trimmable excess crosses `tool_result_stale_trim_batch_chars`, so the prompt
+  prefix moves for a batch and not for one result, and a trimmed id is sticky
+  for the run (`trimmed_tool_result_ids` in the snapshot), so a resumed run
+  rebuilds the same prefix. Pins are honoured unless a later write has falsified
+  them, and a compacted placeholder is never rewritten. Every line of the cut
+  part starting with one of `tool_result_stale_trim_protected_prefixes` (by
+  default the `Cite exactly:` / `Cite:` / `cite_as:` / `Source:` family) is
+  carried over verbatim, so a result keeps its citation identity when it loses
+  its body; the placeholder that replaces the rest names how many characters
+  were kept and how many went, so a trimmed result cannot be read as complete
+  evidence. It runs after the compaction checkpoint and before the split
+  projection, and sizes its head so the split cannot cut its own pointer.
 - `runtime/loop_state.py` — `LoopState` is a pure 7-state machine:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` enforces the legal-edge table;
@@ -614,6 +775,41 @@ policy answering to the same name, and every bound nobody named stays where it
 is. `runtime/error_kinds.py::INTERNAL_ERROR_KIND` is read from both sides of
 this seam, which is why it is a module of its own — "the loop crashed" must not
 have a second spelling on the policy's side.
+
+**Provider failure: what the run says when the endpoint does not answer.**
+`provider_failure.py` ranks three recoveries — a sibling on the run's provider
+chain, the same endpoint after a bounded backoff, and the answer the run
+already has — and two rules keep the last of them honest.
+
+- **Retry is the adapter's verdict, read off the exception.** Every
+  `LLMError` carries `retryable`. The class defaults say the honest thing about
+  the type (`LLMRateLimitError`, `LLMTimeoutError`, `LLMStreamIdleError` and
+  `LLMProviderError` are retryable; `LLMContextWindowExceeded` is not and takes
+  no such keyword), and an adapter that classified the response overrides it per
+  raise — `LLMProviderError("no such model", retryable=False)` fails on the
+  first answer it got. The ladder is bounded by
+  `llm_transient_error_retry_max_attempts` (2) with
+  `llm_transient_error_retry_backoff_base_seconds` (1.0) doubling up to
+  `llm_transient_error_retry_backoff_max_seconds` (8.0), a server-stated
+  `Retry-After` taking precedence within that ceiling. The streak resets on any
+  clean stream, so the bound is per consecutive-failure streak rather than per
+  run. A run that was cancelled, or whose wall-clock budget leaves room only to
+  finalise, starts no further attempt; the backoff itself waits on the stop
+  event, so a cancel mid-pause is noticed at once. Each attempt is a WARNING
+  naming the run and the attempt number, and a `state_changed` event
+  (`reason="transient_llm_error_retry"`) the host can surface.
+- **A run that produced nothing is not asked to write a report.** The wind-down
+  asks the model for the best answer its evidence supports; a run with no prose,
+  no tool call and no tool result has none, and asked to close anyway it invents
+  the run — the operator reads a polite summary of work that never happened and
+  no sign of the failure. So the wind-down is entered only once
+  `query.py::_run_produced_output` is true, and otherwise the run goes terminal
+  FAILED on the provider's own error. After a tool result exists the partial IS
+  an outcome and the wind-down is the right close. Its notice is then per cause
+  (`soft_stop_notice_text_provider_error`), because the general one says the run
+  reached its budget and a model reads that literally; and its `state_changed`
+  events carry `soft_stop_detail` — the upstream's own message — so a host can
+  show the operator why the run ended rather than reconstruct it from a log.
 
 ### The run snapshot: schema version and upcasters
 
@@ -1039,6 +1235,29 @@ the matching RC field says otherwise.
 - `runtime/correctness_bind.py` — glue so intent, ledger, typed hooks, and
   recovery run inside `_drive_turn` (`commit_usage`, `fire_lifecycle`,
   `mark_intent_recovery`, `persist_correctness`).
+- `runtime/history_persist.py` — the one call site for every place the loop
+  hands the working history to the session store (`HistoryDelta`,
+  `HistoryPersister`, `persist_history`). The engine remembers the prefix the
+  store already holds, weakly and by object identity, so a round that appended
+  two messages hands over two rather than the whole transcript. A store that
+  attaches only `persist_session_history` is driven as before; one that also
+  attaches `persist_history_delta` is handed the delta and promises, by
+  returning, that the write landed — the marker advances only after the call
+  returns, and `QueryEngine.forget_persisted_history()` takes the promise back.
+  `QueryEngine.note_session_state_changed()` covers a session that changed in a
+  way its messages do not show, such as a compaction checkpoint. Not in the
+  snapshot: a run picked up on another process cannot know what the store took
+  from the one before it, so its first hand-over rewrites.
+- `runtime/tool_surface.py` — the advertised tool surface, named rather than
+  quoted. `read_tool_surface` serialises and digests the definitions;
+  `tool_surface_tokens` costs them once per digest instead of once per LLM
+  call; `surface_needs_describing` / `note_surface_described` decide whether
+  `tool_surface_advertised` carries each tool's `description`, per reader (the
+  session) rather than per process, and `surface_descriptions(digest)` answers
+  a reader that kept none. Process-global, bounded by
+  `MAX_TOOL_SURFACE_CACHE_ENTRIES` and `MAX_TOOL_SURFACE_AUDIENCES`, and holds
+  nothing a run depends on. The request manifest still records the definitions
+  in full, so what the provider was sent stays recoverable.
 - `runtime/live_control.py` — steer / follow-up queues (`QueuedPrompt`,
   `enqueue`, `place_items`), live model/thinking overrides, and the settled
   helper. Gated by `steer_follow_up_enabled` (default `False`).

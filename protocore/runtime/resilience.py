@@ -187,30 +187,6 @@ def _coerce_positive_seconds(value: object) -> float | None:
     return seconds
 
 
-def is_permanent_failure(exc: BaseException) -> bool:
-    """Whether the adapter's verdict on ``exc`` says asking again cannot help.
-
-    The verdict's own ``retryable`` flag decides when the adapter set one: it
-    read the status and the body, and nothing here knows more. Without the flag
-    the reason decides, and only a reason that collapses to
-    ``deterministic_abort`` — a refused key, an unknown model, a malformed
-    request — counts as permanent. An error with no verdict is never
-    permanent: the adapters' catch-all also carries dropped connections, and
-    reading a bare error as final would stop retrying those.
-    """
-    verdict = _classified_verdict(exc)
-    if verdict is None:
-        return False
-    retryable = getattr(verdict, "retryable", None)
-    if isinstance(retryable, bool):
-        return not retryable
-    reason = getattr(verdict, "reason", None)
-    return (
-        reason is not None
-        and reason_to_error_class(reason) is ResilienceErrorClass.deterministic_abort
-    )
-
-
 def transport_retry_after_seconds(exc: BaseException) -> float | None:
     """Extract a server-stated reset / retry-after hint from an exception.
 
@@ -1020,7 +996,6 @@ __all__ = [
     "classify_transport_error",
     "deadline_finalization_reserve_ok",
     "decorrelated_jitter_backoff",
-    "is_permanent_failure",
     "reason_to_error_class",
     "resilient_transport_call",
     "transport_retry_after_seconds",

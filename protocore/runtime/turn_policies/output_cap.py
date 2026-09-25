@@ -48,6 +48,7 @@ from protocore.contracts.types import (
     TextBlock,
     ToolCall,
 )
+from protocore.runtime import forced_terminal as _forced_terminal
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -180,17 +181,25 @@ class OutputCapRecoveryPolicy:
             turn.finish_reason in ("length", "")
             and not turn.pending_tool_calls
             and not turn.engine.stop_requested
-            and not (turn.reasoning_emitted and not turn.text_emitted)
+            # A forced terminal call after a delivered answer has no prose to
+            # resume: its text is suppressed, and asking the model to carry on
+            # under a finished answer invites a second one. The forcing
+            # retries such a round on its own budget.
+            and _forced_terminal.request_mode(turn.engine) is None
+            and not (
+                turn.finish_reason == "length"
+                and turn.reasoning_emitted
+                and not turn.text_emitted
+            )
         ):
-            # A round that is reasoning and nothing else is not cut mid-prose:
-            # there is no prose to resume, and the reasoning is not kept. The
-            # empty-model-turn policy answers for that round.
             # An empty finish reason is folded in here. Some providers end the
             # stream cleanly with no finish delta at all, and reading that as a
             # normal completion let a mid-sentence partial be persisted as the
             # run's final answer. A finish-less, call-less stream is an
             # incomplete turn, and gets the same bounded resume a length cap
-            # does. A cancel also leaves the finish reason empty, which is why
+            # does. A reasoning-only length cut has its own recovery ladder in
+            # EmptyModelTurnPolicy and must not be persisted as prose here. A
+            # cancel also leaves the finish reason empty, which is why
             # a stopped run is excluded: an interrupted turn is not recovered.
             async for event in self._cut_mid_prose(turn):
                 yield event

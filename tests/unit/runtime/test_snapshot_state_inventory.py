@@ -53,6 +53,12 @@ _PROCESS_LOCAL: dict[str, str] = {
         "provider_chain_model_name, and the engine is re-seated onto it."
     ),
     "compaction_llm": "the summarising provider is injected by the host.",
+    "_exact_token_counts": (
+        "a cache of what one endpoint answered and a monotonic back-off clock, "
+        "both meaningless in another process. What counting taught the run is "
+        "carried: it lives in token_estimate_calibration, which the snapshot "
+        "keeps; a resumed run counts again once near the edge."
+    ),
     "tools": (
         "the registry is built by the host from its own catalog. What the run "
         "did to that surface is carried separately — the broken tools, the "
@@ -102,6 +108,11 @@ _PROCESS_LOCAL: dict[str, str] = {
         "read OUT of the snapshot rather than written into it: it is the "
         "background_task_ids of the payload this engine was resumed from, and a "
         "run that was never resumed has none."
+    ),
+    "_token_estimate_calibration_baseline": (
+        "the destination engine's configured calibration is the fallback for a "
+        "different model; a learned run value is carried separately with its "
+        "model identity"
     ),
 }
 
@@ -319,6 +330,10 @@ _RESTORED_BY_HELPER: dict[str, str] = {
         "compared against the digest the payload carried; assigning the "
         "block from the payload would resume onto a catalog that may no "
         "longer exist."
+    ),
+    "_token_estimate_calibration_model": (
+        "restored together with the learned factor through "
+        "set_token_estimate_calibration after the effective model is known"
     ),
 }
 

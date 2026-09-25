@@ -29,6 +29,7 @@ from protocore.contracts.llm import LLMStreamEvent
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
+    TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY,
     TERMINAL_TOOL_METADATA_KEY,
     Message,
     MessageRole,
@@ -223,11 +224,11 @@ async def test_meta_text_suppressed_live_and_durable_answer_kept(
     user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text="12*12?")])
     events = [evt async for evt in engine.run(user_msg)]
 
-    # The nudge fired (write-first recovery + Finalize path preserved).
+    # The answer was followed by a forced Finalize request, not a nudge.
     reasons = [
         e.payload.get("reason") for e in events if e.type is EventType.STATE_CHANGED
     ]
-    assert "terminal_tool_nudge" in reasons
+    assert "terminal_tool_forced" in reasons
     # Two LLM turns happened (answer + terminal-only).
     assert len(in_memory_runtime["llm"].calls) == 2
     # Finalize actually ran (background gate executed).
@@ -250,49 +251,65 @@ async def test_meta_text_suppressed_live_and_durable_answer_kept(
 async def test_blocker_prose_no_write_still_triggers_write(
     engine_factory, in_memory_runtime
 ) -> None:
-    """"Создай файл index.html" answered with prose and 0 tools MUST still
-    be nudged into the actual Write. The file gets written; suppression
-    NEVER skips the nudge."""
+    """"Создай файл index.html" answered with prose and 0 tools: the claim is
+    sealed by a forced Finalize, the Finalize that declares the missing file
+    is refused, and the refusal gets the file actually written. Suppression
+    never hides the answer written after the work."""
     rc = _finalize_rc()
-    # Re-enable write-first steering (the live default) for the file-deliverable
-    # path — the nudge then prepends the Write instruction.
-    rc = rc.model_copy(update={"terminal_tool_nudge_write_first_enabled": True})
     engine = engine_factory(rc=rc, expected_terminal_tool="Finalize")
     write_tool = _RecordingWriteTool()
-    finalize_tool = _BackgroundFinalizeTool()
+
+    class _CheckingFinalize(_BackgroundFinalizeTool):
+        async def invoke(self, context, arguments):  # type: ignore[no-untyped-def]
+            if not write_tool.calls:
+                self.calls.append(dict(arguments))
+                return ToolResult(
+                    tool_call_id="",
+                    content="index.html was declared but does not exist",
+                    is_error=True,
+                    metadata={TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY: True},
+                )
+            return await super().invoke(context, arguments)
+
+    finalize_tool = _CheckingFinalize()
     in_memory_runtime["tools"].register(write_tool)
     in_memory_runtime["tools"].register(finalize_tool)
+    llm = in_memory_runtime["llm"]
 
     # Turn 1: prose claiming the file was created, but ZERO tools.
-    in_memory_runtime["llm"]._scripted_streams.append(
-        _text_turn_stream("Done, I created index.html.")
+    llm._scripted_streams.append(_text_turn_stream("Done, I created index.html."))
+    # Turn 2 (forced Finalize): the declared file is missing, so it is refused.
+    llm.queue_tool_call_response(
+        tool_call_id="fin-1",
+        tool_name="Finalize",
+        tool_input={"declared_deliverables": [{"path": "index.html"}]},
     )
-    # Turn 2 (post-nudge): the model now actually calls Write.
-    in_memory_runtime["llm"].queue_tool_call_response(
+    # Turn 3 (a tool is required): the model writes the file.
+    llm.queue_tool_call_response(
         tool_call_id="w-1",
         tool_name="Write",
         tool_input={"path": "index.html", "content": "<html></html>"},
     )
-    # Turn 3: seal via Finalize.
-    in_memory_runtime["llm"].queue_tool_call_response(
-        tool_call_id="fin-1",
+    # Turn 4 (free again): the answer; turn 5 (forced): the seal.
+    llm._scripted_streams.append(_text_turn_stream("index.html is written."))
+    llm.queue_tool_call_response(
+        tool_call_id="fin-2",
         tool_name="Finalize",
-        tool_input={},
+        tool_input={"declared_deliverables": [{"path": "index.html"}]},
     )
 
     user_msg = Message(
         role=MessageRole.user,
         content_blocks=[TextBlock(text="Создай файл index.html")],
     )
-    async for _ in engine.run(user_msg):
-        pass
+    events = [evt async for evt in engine.run(user_msg)]
 
-    # THE BLOCKER ASSERTION: the file actually got written (the nudge fired,
-    # write-first recovery ran, suppression did NOT skip it).
+    # THE BLOCKER ASSERTION: the file actually got written.
     assert len(write_tool.calls) == 1
     assert write_tool.calls[0]["path"] == "index.html"
-    # Finalize then sealed the run.
-    assert len(finalize_tool.calls) == 1
+    assert "index.html is written." in _streamed_text(events)
+    # Finalize was refused once, then sealed the run.
+    assert len(finalize_tool.calls) == 2
     assert engine.state is LoopState.COMPLETED
 
 

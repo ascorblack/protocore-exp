@@ -18,8 +18,6 @@ Covers, with universal (non-eval-tuned) assertions:
 """
 from __future__ import annotations
 
-from itertools import pairwise
-
 import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
@@ -27,6 +25,8 @@ from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     COMPACTION_SUMMARY_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_METADATA_KEY,
+    SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     CompactionSourceRef,
     Message,
     MessageRole,
@@ -38,9 +38,12 @@ from protocore.runtime.context.budgets import derive_budgets
 from protocore.runtime.context.compaction import (
     CompactionState,
     _build_summarisation_units,
+    _foldable_indices,
     _is_compaction_summary,
+    _is_plain_operator_turn,
     current_tool_batch_protect_index,
     estimate_history_tokens,
+    estimate_message_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
 )
@@ -75,8 +78,55 @@ def test_emergency_tokens_derived_and_above_trigger() -> None:
     assert budgets.compaction_emergency_tokens == int(
         rc.model_context_window * rc.compaction_emergency_ratio
     )
-    # The RC validator guarantees trigger_ratio < emergency_ratio.
+    # The RC validator guarantees trigger_ratio < emergency_ratio, and the
+    # trigger only ever moves DOWN from its ratio.
     assert budgets.compaction_emergency_tokens > budgets.compaction_trigger_tokens
+
+
+def test_synthetic_user_recovery_is_not_an_operator_or_fold_source() -> None:
+    rc = LoopConstants(
+        compaction_fold_keep_operator_turns=1,
+        compaction_protect_first_user_turn=True,
+    )
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="study animals")]),
+        Message(
+            role=MessageRole.system,
+            content_blocks=[TextBlock(text="older compacted work")],
+            metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="synthetic circus repair")],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="focus on mammals")]),
+        Message(
+            role=MessageRole.system,
+            content_blocks=[TextBlock(text="newer compacted work")],
+            metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="synthetic terminal repair")],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="compare mammals")]),
+    ]
+
+    assert _is_plain_operator_turn(history[3])
+    assert not _is_plain_operator_turn(history[2])
+    assert not _is_plain_operator_turn(history[5])
+    assert history[-1].text == "compare mammals"
+    foldable = _foldable_indices(history, len(history), rc)
+    assert foldable == frozenset({1, 3, 4})
+    assert 0 not in foldable
+    assert 5 not in foldable
+    assert 6 not in foldable
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +469,221 @@ async def test_existing_summary_anchor_skipped() -> None:
     assert len(llm.calls) == 0
 
 
+@pytest.mark.asyncio
+async def test_tier2_drops_aged_synthetic_nudge_without_summarising_it() -> None:
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    marker = "INTERNAL RECOVERY MUST NOT BECOME USER INTENT " * 30
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="real task")]),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="aged answer " * 40)],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=marker)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="another aged answer " * 40)],
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent steer")]),
+    ]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="FIRST SUMMARY")
+    llm.queue_response(text="SECOND SUMMARY")
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1),
+        model_name="m",
+    )
+
+    assert result.turns_summarised == 2
+    assert result.tokens_freed > 0
+    assert all(marker not in message.text for message in history)
+    assert history[0].text == "real task"
+    prompts = "\n".join(message.text for call in llm.calls for message in call.messages)
+    assert marker not in prompts
+
+
+@pytest.mark.asyncio
+async def test_tier2_cleanup_only_satisfies_target_without_provider_call() -> None:
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    synthetic = Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text="discard internal recovery " * 20)],
+        metadata={
+            SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+        },
+    )
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="real task")]),
+        synthetic,
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
+    ]
+    llm = InMemoryLLMProvider()
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="m",
+        free_target_tokens=1,
+    )
+
+    assert result.turns_summarised == 0
+    assert result.tokens_freed == estimate_message_tokens(synthetic, rc)
+    assert len(llm.calls) == 0
+    assert [message.text for message in history] == ["real task", "recent"]
+
+
+@pytest.mark.asyncio
+async def test_tier2_provider_failure_keeps_the_deterministic_cleanup() -> None:
+    """A failed summariser call costs its own unit and nothing else.
+
+    Dropping an aged synthetic recovery nudge needs no provider, so it is not
+    undone by a call that failed elsewhere in the pass: the pass commits what
+    it actually achieved and counts the failure against the unit that caused it.
+    """
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    class FailingSummaryLLM(InMemoryLLMProvider):
+        async def complete_structured(self, request, schema):  # type: ignore[no-untyped-def]
+            raise RuntimeError("summary unavailable")
+
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="real task")]),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="aged answer " * 40)],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="internal recovery " * 20)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
+    ]
+    synthetic_tokens = estimate_message_tokens(history[2], LoopConstants(
+        model_context_window=4_096, compaction_keep_recent_turns=1
+    ))
+    state = CompactionState()
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=FailingSummaryLLM(),
+        state=state,
+        rc=LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1),
+        model_name="m",
+    )
+
+    # Nothing was summarised, but the nudge the runtime had put there is gone.
+    assert result.turns_summarised == 0
+    assert result.tokens_freed == synthetic_tokens
+    assert [message.text for message in history] == [
+        "real task",
+        "aged answer " * 40,
+        "recent",
+    ]
+    assert state.summarised_turn_ids == set()
+    # A transport failure says nothing about the unit, so nothing is written
+    # off: the next pass tries it again.
+    assert state.failed_anchor_keys == {}
+
+
+@pytest.mark.asyncio
+async def test_tier2_record_failure_leaves_history_unchanged() -> None:
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")]),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="aged answer " * 40)],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="internal recovery " * 20)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
+    ]
+    before = [message.model_dump(mode="json") for message in history]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="summary")
+
+    async def fail_record(_request) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("record unavailable")
+
+    with pytest.raises(RuntimeError, match="record unavailable"):
+        await run_tier2_summarisation(
+            history=history,
+            compaction_llm=llm,
+            state=CompactionState(),
+            rc=LoopConstants(
+                model_context_window=4_096, compaction_keep_recent_turns=1
+            ),
+            model_name="m",
+            record_request=fail_record,
+        )
+
+    assert [message.model_dump(mode="json") for message in history] == before
+
+
+@pytest.mark.asyncio
+async def test_tier2_prompt_failure_leaves_history_unchanged() -> None:
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    class FailingPrompts:
+        def render(self, name, variables):  # type: ignore[no-untyped-def]
+            raise RuntimeError("prompt unavailable")
+
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")]),
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="aged answer " * 40)],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="internal recovery " * 20)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_TERMINAL_REPAIR
+            },
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
+    ]
+    before = [message.model_dump(mode="json") for message in history]
+
+    with pytest.raises(RuntimeError, match="prompt unavailable"):
+        await run_tier2_summarisation(
+            history=history,
+            compaction_llm=InMemoryLLMProvider(),
+            state=CompactionState(),
+            rc=LoopConstants(
+                model_context_window=4_096, compaction_keep_recent_turns=1
+            ),
+            model_name="m",
+            prompts=FailingPrompts(),  # type: ignore[arg-type]
+        )
+
+    assert [message.model_dump(mode="json") for message in history] == before
+
+
 # ---------------------------------------------------------------------------
 # the dedup key must distinguish DISTINCT turns with identical content
 # (the documented content-missing Write-retry spiral: same name+arguments_json,
@@ -583,6 +848,54 @@ async def test_seeded_turns_protected_from_tier2_summary() -> None:
     # Seeded turn stays verbatim AND keeps its tag.
     assert history[0].text.startswith("SEEDED PRIOR TURN")
     assert history[0].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_tier2_keeps_mixed_provenance_tool_unit_atomic() -> None:
+    """A summary cannot represent a tool pair with two persistence provenances."""
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=1,
+        compaction_protect_first_user_turn=False,
+    )
+    history = [
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[
+                ToolUseBlock(
+                    tool_call_id="mixed",
+                    name="read",
+                    arguments_json='{"path":"old"}',
+                )
+            ],
+            metadata={SESSION_HISTORY_SEED_METADATA_KEY: True},
+        ),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="mixed", content="large result " * 200)
+            ],
+        ),
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="current task")]),
+    ]
+    before = [message.model_dump_json() for message in history]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="must not be used")
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+        compact_seeded_history=True,
+    )
+
+    assert result.turns_summarised == 0
+    assert llm.calls == ()
+    assert [message.model_dump_json() for message in history] == before
 
 
 @pytest.mark.asyncio
@@ -759,6 +1072,7 @@ async def _drive_long_tool_chain(
     # Small window so big tool outputs cross the trigger within the run.
     rc = LoopConstants(
         model_context_window=window,
+        request_context_safety_tokens=0,
         compaction_per_iteration_enabled=per_iteration_enabled,
         # Keep the test deterministic: only Tier-1 (no summariser LLM).
         compaction_keep_recent_turns=2,
@@ -850,38 +1164,34 @@ async def test_per_iteration_gate_kill_switch_reverts_to_turn_start_only(
     ]
     assert not per_iter
 
-    # Contrast proof: with the gate OFF the per-call prompt grows MONOTONICALLY
-    # (the b5a0762e inflation) far past the trigger — the gate is load-bearing.
+    # Contrast proof: with the gate OFF a provider-bound prompt grows past the
+    # proactive trigger. The hard request ceiling still prevents an oversized
+    # call and routes the next attempt through reactive compaction.
     budgets = derive_budgets(rc)
-    estimates = [_prompt_estimate(req) for req in llm.calls if req.messages]
+    requests = [request for request in llm.calls if request.messages]
+    estimates = [_prompt_estimate(request) for request in requests]
     assert estimates
-    assert max(estimates) > budgets.compaction_emergency_tokens
-    # Strictly increasing across the tool-call iterations (ignoring the final
-    # short answer turn): each iteration adds an un-shed tool result.
-    growth = estimates[: len(estimates) - 1] if len(estimates) > 1 else estimates
-    assert all(b >= a for a, b in pairwise(growth)), growth
+    assert max(estimates) > budgets.compaction_trigger_tokens
+    assert all(
+        estimate + request.max_tokens <= rc.model_context_window
+        for estimate, request in zip(estimates, requests, strict=True)
+    )
 
 
 @pytest.mark.asyncio
-async def test_real_provider_prompt_size_triggers_compaction_when_estimate_low(
+async def test_observed_prompt_size_does_not_drive_history_only_compaction(
     engine_factory, in_memory_runtime
 ) -> None:
-    """The compaction gate must fire on the provider's real reported prompt
-    size, not only the char heuristic. Regression for the deepseek-v4-flash
-    stress case: a 65536-window run whose provider reported ~148K input tokens
-    (2.25x window) never compacted because the cheap char estimate of the
-    (adversarial, digit/multilingual) history stayed below the trigger.
+    """A count from an older wire envelope cannot size history by itself.
 
-    Here the history bytes are trivially small (a tiny tool result), so the
-    estimate is far below trigger — the ONLY signal above trigger is the
-    provider-reported ``input_tokens``. Compaction must still fire.
+    The provider reports a deliberately enormous count on a tiny first action
+    request. The following per-iteration gate has only history, not the full
+    current request's model/tool/context envelope, so it must rely on the
+    calibrated current-history estimate and leave the stale scalar out.
     """
     rc = LoopConstants(
         model_context_window=4_096,
         compaction_per_iteration_enabled=True,
-        # Protect the whole (tiny) history from Tier-2 so no summariser LLM
-        # call is made — keeps the scripted mock queue deterministic. The gate
-        # firing at all is what this test asserts.
         compaction_keep_recent_turns=50,
         compaction_failed_max_retries=10,
     )
@@ -911,24 +1221,10 @@ async def test_real_provider_prompt_size_triggers_compaction_when_estimate_low(
 
     assert estimate_history_tokens(engine.history, rc) < budgets.compaction_trigger_tokens
 
-    # The observed-prompt-tokens floor drove a proactive per-iteration
-    # compaction even though the estimate is tiny.
-    proactive = [
-        e
-        for e in events
-        if e.type is EventType.COMPACTION_STARTED
-        and str(e.payload.get("reason", "")).startswith("proactive_per_iteration")
-    ]
-    assert proactive, "compaction never fired on the real provider prompt size"
-
-    # Exactly once: resetting the floor to 0 after compaction prevents the gate
-    # from oscillating (re-firing every iteration on a stale high-water mark).
     all_started = [e for e in events if e.type is EventType.COMPACTION_STARTED]
-    assert len(all_started) == 1, [e.payload.get("reason") for e in all_started]
-
-    # After compaction the stale high-water mark is cleared so the gate does
-    # not re-fire on a history that no longer exists.
-    assert engine.last_observed_prompt_tokens == 0
+    assert all_started == []
+    assert engine.state is LoopState.COMPLETED
+    assert engine.last_observed_prompt_tokens == 147_892
 
 
 # ---------------------------------------------------------------------------

@@ -224,6 +224,7 @@ async def test_query_compact_then_retry_settled_only_at_end(
     llm.queue_response(text="ok after compact")
     rc = _enabled(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )
@@ -497,8 +498,13 @@ async def test_snapshot_resume_keeps_steer_queue(engine_factory) -> None:
     engine = engine_factory(rc=_enabled())
     engine._steer_queue = [new_queued_prompt("steer", "keep me").to_dict()]
     engine._pinned_tool_result_ids.add("abc")
+    engine._trimmed_tool_result_ids = frozenset({"def"})
     snap = engine.snapshot()
     other = engine_factory(rc=_enabled())
     await other.resume_from_snapshot(snap)
     assert other._steer_queue[0]["text"] == "keep me"
     assert "abc" in other._pinned_tool_result_ids
+    # The trim is sticky for the run, so a run resumed in another process must
+    # rebuild the same view — a forgotten set cuts a different batch and moves
+    # the prompt prefix on the first request after the resume.
+    assert other._trimmed_tool_result_ids == frozenset({"def"})

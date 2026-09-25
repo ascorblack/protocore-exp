@@ -24,7 +24,7 @@ from protocore.contracts.blob import IBlobStore
 from protocore.contracts.config import IConstantsRegistry, ICoreConstantsProvider
 from protocore.contracts.events import IEventStream
 from protocore.contracts.hooks import IHookManager
-from protocore.contracts.llm import ILLMProvider, IProviderChain
+from protocore.contracts.llm import ILLMProvider, IProviderChain, IRequestTokenCounter
 from protocore.contracts.memory import IMemory, IMemoryContentScanner
 from protocore.contracts.middleware import ILifecycleRegistry
 from protocore.contracts.observability import CacheObserverProtocol
@@ -120,6 +120,12 @@ class ProviderChainConformance(ContractSuite):
     """The one-way demotion cursor over a run's providers."""
 
     protocol = IProviderChain
+
+
+class RequestTokenCounterConformance(ContractSuite):
+    """The optional provider capability that sizes a rendered request."""
+
+    protocol = IRequestTokenCounter
 
 
 class MemoryConformance(ContractSuite):
@@ -236,6 +242,7 @@ SUITES: tuple[type[ContractSuite], ...] = (
     LifecycleRegistryConformance,
     LLMProviderConformance,
     ProviderChainConformance,
+    RequestTokenCounterConformance,
     MemoryConformance,
     MemoryContentScannerConformance,
     CacheObserverConformance,

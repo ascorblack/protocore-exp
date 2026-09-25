@@ -108,6 +108,7 @@ from protocore.runtime.loop_state import (
     assert_transition,
     is_terminal,
 )
+from protocore.runtime.request_budget import ExactTokenCountCache
 from protocore.runtime.usage import TokenUsage
 
 _logger = logging.getLogger(__name__)
@@ -736,12 +737,15 @@ class QueryEngine:
             "compact_checkpoint",
             "context_manager",
             "last_observed_prompt_tokens",
+            # What counting has learned: counts keyed by content, the last full
+            # request counted, and a back-off after a failed count. The next
+            # turn is the same conversation on the same endpoint, so none of it
+            # goes stale at a turn boundary, and the cache is bounded.
+            "_exact_token_counts",
+            "_token_estimate_calibration_baseline",
+            "_token_estimate_calibration_model",
             "last_heartbeat_ms",
             "_pinned_tool_result_ids",
-            # The results this run has already cut down for the outbound view.
-            # A turn boundary may not forget them: forgetting one puts the whole
-            # result back in the next request and moves the prompt prefix for
-            # nothing.
             "_trimmed_tool_result_ids",
             "_skill_catalog_block",
             # The digest the run's catalog block had before it was picked up,
@@ -870,11 +874,10 @@ class QueryEngine:
         self.total_usage = TokenUsage()
         # Real provider-reported prompt size (full prompt_tokens, normalised
         # into input_tokens by the adapters) for the most recent LLM call.
-        # Ground truth for the compaction gate — the
-        # char heuristic under-counts adversarial content, so this floors the
-        # decision. 0 means "no real measurement yet" (cold start or just after
-        # a compaction shrank history), in which case the gate falls back to
-        # the cheap estimate until the next LLM call refreshes it.
+        # Ground truth for adaptive calibration: the char heuristic under-counts
+        # adversarial content, so provider usage trains the multiplier applied
+        # to later current-request estimates. The scalar itself never floors a
+        # different request or a history-only compaction decision.
         self.last_observed_prompt_tokens: int = 0
         self.turn_count = 0
         self.last_heartbeat_ms: int = 0
@@ -933,8 +936,58 @@ class QueryEngine:
         # Only one force_compaction attempt allowed per message
         # before the run goes terminal FAILED.
         self._compaction_attempted_for_current_turn: bool = False
+        # Set only by the provider-rejection handler once it has run the
+        # reactive compaction profile for this message. A proactive pass that
+        # was carried into the message does not set it: that pass keeps the
+        # routine window and never touches seeded history, so it proves
+        # nothing about what the reactive profile could still free.
+        self._reactive_compaction_attempted_for_current_turn: bool = False
+        # A proactive pass performed between assistant messages belongs to the
+        # request that follows it. The next recovery reset consumes this latch
+        # and marks that message's one compaction allowance as already spent.
+        self._proactive_compaction_attempted_for_next_message: bool = False
+        # Set when a proactive pass exhausted the retry budget: the LLM tiers
+        # of proactive compaction stand down for this many more gate visits
+        # (Tier 1, which needs no LLM, keeps running). A rejection lifts it at
+        # once, and so does history growing past
+        # ``compaction_proactive_suspension_growth_ratio`` of the prompt it was
+        # suspended at, recorded beside it.
+        self._proactive_suspension_gates_left: int = 0
+        self._proactive_suspension_prompt_tokens: int = 0
+        # The last proactive probe that found nothing to do: its profile
+        # (forced, protected tail, LLM tiers included), the constants it was
+        # judged under and the history it saw. Messages and constants are
+        # immutable, so the same objects are the same answer, and the gate is
+        # skipped without asking the tiers again.
+        self._idle_compaction_probe: (
+            tuple[tuple[bool, int | None, bool], LoopConstants, tuple[Message, ...]] | None
+        ) = None
+        # Actual max_tokens on the most recent fitted assistant request. Kept
+        # only until this assistant-message boundary so an upstream context
+        # rejection can derive a retry ceiling from what was really sent.
+        self._last_fitted_request_max_tokens: int | None = None
+        # The model and the heuristic's raw size of the request last handed to
+        # the provider. A rejection for length reads it to learn how far the
+        # estimate ran short; ``None`` while nothing has been sent this message.
+        self._last_dispatched_prompt: tuple[str, int] | None = None
+        # Exact counts a provider has already made of this run's requests, the
+        # last full request it counted, and any back-off after a failed count.
+        self._exact_token_counts = ExactTokenCountCache()
+        # The model an exact count last calibrated the estimate for, this turn.
+        self._exact_count_model: str | None = None
+        # One-shot ceiling for a rebuilt request after an upstream context
+        # rejection. Derived from the rejected wire cap, never from the
+        # pre-fit output budget, so direct correction or partial compaction
+        # cannot raise the retry.
+        self._context_overflow_retry_max_tokens: int | None = None
+        # Number of strictly smaller output caps issued after context-window
+        # rejections in this message. A separate latch still limits compaction
+        # to one attempt.
+        self._context_overflow_corrective_retry_count: int = 0
         # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
         self.compaction_backoff_left: int = 0
+        # The prompt's size when that backoff was set, so growth can end it.
+        self.compaction_backoff_prompt_tokens: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
         # already issued in the current message stream.
         self._max_output_recovery_count: int = 0
@@ -996,6 +1049,10 @@ class QueryEngine:
         # beyond → terminal FAILED with kind=``thinking_eats_all_tokens``.
         # Per-turn lifecycle — reset on every new ``engine.run()`` call.
         self._consecutive_empty_responses: int = 0
+        # Dedicated reasoning-only length-cut retry rung. It is separate from
+        # model-ended thinking-only responses so alternating finish modes
+        # cannot skip or replenish either recovery ladder.
+        self._reasoning_length_cut_count: int = 0
         # Post-tool empty-response recovery counter. Counts consecutive
         # FULLY-empty assistant turns (no text, no tool calls, AND no
         # reasoning_content) that arrive immediately after a tool-result turn.
@@ -1034,6 +1091,12 @@ class QueryEngine:
         # discovery calls. The runtime never synthesises the answer — the
         # model still chooses message / outcome / refs.
         self._terminal_only_active: bool = False
+        # The terminal call a run owes once its answer is delivered, and the
+        # forced requests spent on it (``protocore.runtime.forced_terminal``).
+        # Per run, snapshot-persisted, lowered with the terminal-only latch.
+        self._terminal_call_forced: bool = False
+        self._terminal_call_forced_attempts: int = 0
+        self._terminal_call_forced_mode: str | None = None
 
         # Wall-clock budget. Monotonic timestamp captured at
         # ``run()`` entry; the wall-clock equivalent (epoch seconds) is persisted
@@ -1107,6 +1170,10 @@ class QueryEngine:
         # Live-run guardrails / interaction. Default-empty so a snapshot
         # taken before these fields existed resumes with prior behaviour.
         self._pinned_tool_result_ids: set[str] = set()
+        # Which results the request view has already cut down to their head.
+        # Sticky for the run and snapshot-persisted: re-deciding per build
+        # would let a trimmed result come back whole and move the prompt
+        # prefix, which is the cache miss the batching exists to avoid.
         self._trimmed_tool_result_ids: frozenset[str] = frozenset()
         self._identical_tool_counts: dict[str, int] = {}
         self._loop_guard_nudge_count: int = 0
@@ -1115,10 +1182,12 @@ class QueryEngine:
         self._live_model_name: str | None = None
         self._live_thinking_enabled: bool | None = None
         self._live_reasoning_effort: str | None = None
-        # The live thinking and effort as they stood before a retry after a
-        # reasoning-only length cut turned them down; ``None`` while no retry
-        # is out. The next round that produces anything puts them back.
-        self._reasoning_cut_saved: tuple[bool | None, str | None] | None = None
+        self._token_estimate_calibration_baseline: float = (
+            config.rc.token_estimate_calibration
+        )
+        self._token_estimate_calibration_model: str = config.model_name
+        self._reasoning_recovery_thinking_enabled: bool | None = None
+        self._reasoning_recovery_effort: str | None = None
         self._run_settled_emitted: bool = False
 
         # Ordered record of the tool calls this run DISPATCHED. Written at the
@@ -1448,6 +1517,11 @@ class QueryEngine:
         # rather than about the turn, and clearing it at a turn boundary would
         # hand the model back the tools the stop took away.
         self._terminal_only_active = False
+        # The forced terminal call belongs to the answer this run delivered; a
+        # new turn has delivered nothing yet and owes no call.
+        self._terminal_call_forced = False
+        self._terminal_call_forced_attempts = 0
+        self._terminal_call_forced_mode = None
         # Reset the transient-stream-error (rate-limit / timeout) retry counter
         # per run for the same reason: a reused engine must start each run with
         # its full retry budget, not one left exhausted by a prior run that
@@ -1531,7 +1605,31 @@ class QueryEngine:
 
             _run_preconditions.observe_injected_result_message(self, initial_message)
         self.turn_count += 1
+        # A continuation (no new message) re-drives the turn that was already
+        # open, and a terminal call that turn was forcing is still owed: the
+        # answer it seals is in the history being continued. Dropping the
+        # forcing here would hand a run picked up on another pod a free request
+        # under a finished answer — the request that writes a second one.
+        carried_forcing = (
+            (
+                self._terminal_call_forced,
+                self._terminal_call_forced_attempts,
+                self._terminal_call_forced_mode,
+            )
+            if initial_message is None
+            else None
+        )
         self._reset_per_turn_state()
+        if carried_forcing is not None:
+            (
+                self._terminal_call_forced,
+                self._terminal_call_forced_attempts,
+                self._terminal_call_forced_mode,
+            ) = carried_forcing
+            # The latch that goes with a forcing (the final-turn output floor,
+            # the narration suppressor) goes with it across the continuation.
+            if self._terminal_call_forced:
+                self._terminal_only_active = True
         # Stamp the run-start clock ONCE for the wall-clock budget. A resumed run
         # keeps the start it was rehydrated with
         # (``resume_from_snapshot`` set ``_run_started_monotonic`` from the
@@ -1604,12 +1702,6 @@ class QueryEngine:
             yield
         finally:
             self._current_turn_task = None
-            if self.is_terminal:
-                # The wind-down notice was for this run; the next one starts
-                # with its tools and must not read that they are gone.
-                from protocore.runtime import soft_stop as _soft_stop
-
-                _soft_stop.leave(self)
             await self._persist_snapshot()
             await asyncio.shield(
                 asyncio.ensure_future(self.retire_own_background_work())
@@ -1921,6 +2013,19 @@ class QueryEngine:
             rc=self.config.rc,
             roles=self.config.tool_roles,
         )
+        # A forced terminal call must name a tool the request advertises, so
+        # while one is owed the terminal tool is pinned past the retrieval clip.
+        from protocore.runtime import forced_terminal as _forced_terminal
+
+        terminal_tool = self.config.expected_terminal_tool
+        if (
+            terminal_tool
+            and _forced_terminal.is_armed(self)
+            and terminal_tool not in policy.forced_pinned
+        ):
+            policy = policy.model_copy(
+                update={"forced_pinned": policy.forced_pinned | {terminal_tool}}
+            )
         # The wind-down has the last word, and it has to. Everything above this
         # line is a mechanism for keeping a tool on the surface — the RC floor
         # bypasses the retrieval clip, the discovery pins bypass it too, the
@@ -2046,6 +2151,10 @@ class QueryEngine:
         # subagents that may still be drawing on it — but the per-run streaks
         # and one-shot signals inside it are allowances like any other.
         self.run_state.clear_run_scoped_streaks()
+        # The compaction state is continuity — what was summarised, what was
+        # shed, which units the summariser cannot handle — but its retry
+        # budgets are allowances sized for one question, like the rest.
+        self.compaction_state.reset_retries()
 
     def transition_to(self, new_state: LoopState) -> None:
         """Validate then apply a state transition.
@@ -2060,6 +2169,8 @@ class QueryEngine:
         # wait is still on the stack.
         assert_awaiting_is_witnessed(new_state, len(self._pending_interrupts))
         self.state = new_state
+        if is_terminal(new_state):
+            self.reset_reasoning_recovery()
 
     def turn_id(self) -> str:
         """Wire turn identifier for the current in-flight assistant-message round.
@@ -2112,7 +2223,14 @@ class QueryEngine:
 
         * ``_compaction_attempted_for_current_turn`` — a run that ate two
           distinct PTLs in two separate model calls still gets one recovery
-          attempt each.
+          attempt each. The caller consumes the proactive-compaction latch
+          immediately after this reset when a turn-start or per-iteration pass
+          already prepared the message that is about to open.
+        * ``_last_fitted_request_max_tokens`` and
+          ``_context_overflow_retry_max_tokens`` — the rejected wire cap and
+          its derived retry ceiling belong only to that same model call.
+        * ``_context_overflow_corrective_retry_count`` — the message gets a
+          bounded sequence of strictly smaller corrective output caps.
         * ``_max_output_recovery_count`` — only consecutive
           truncations within one message exhaust the budget.
 
@@ -2137,11 +2255,23 @@ class QueryEngine:
         constraint applies to exactly that one message.
         """
         self._compaction_attempted_for_current_turn = False
-        self.compaction_backoff_left = 0
+        self._reactive_compaction_attempted_for_current_turn = False
+        self._last_fitted_request_max_tokens = None
+        self._last_dispatched_prompt = None
+        self._context_overflow_retry_max_tokens = None
+        self._context_overflow_corrective_retry_count = 0
+        # ``compaction_backoff_left`` is deliberately NOT reset: it counts
+        # iterations, and an iteration is an assistant message, so a reset here
+        # cleared it before the gate could ever skip one.
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False
         else:
             self._max_output_recovery_count = 0
+
+    @property
+    def proactive_compaction_suspended(self) -> bool:
+        """Whether proactive compaction's LLM tiers are standing down after exhaustion."""
+        return self._proactive_suspension_gates_left > 0
 
     def remember_tool_name(self, tool_call_id: str, tool_name: str) -> None:
         self._pending_tool_call_names[tool_call_id] = tool_name
@@ -2512,10 +2642,19 @@ class QueryEngine:
             "pending_interrupts": serialise_interrupts(self._pending_interrupts),
             "usage": self.total_usage.to_dict(),
             "last_observed_prompt_tokens": self.last_observed_prompt_tokens,
+            "token_estimate_calibration": self.config.rc.token_estimate_calibration,
+            "token_estimate_calibration_model": (
+                self._token_estimate_calibration_model
+            ),
             "compaction": {
                 "retry_count": self.compaction_state.retry_count,
+                "reactive_retry_count": self.compaction_state.reactive_retry_count,
                 "summarised_turn_ids": list(self.compaction_state.summarised_turn_ids),
                 "blob_refs_created": list(self.compaction_state.blob_refs_created),
+                # The per-unit failure census. Without it a resumed run starts
+                # paying again for the units the summariser already proved it
+                # cannot summarise.
+                "failed_anchor_keys": dict(self.compaction_state.failed_anchor_keys),
             },
             "last_heartbeat_ms": self.last_heartbeat_ms,
             # Persist the terminal-only latch so an executor pod that
@@ -2525,6 +2664,11 @@ class QueryEngine:
             # correctness-affecting runtime state must not rely on per-pod
             # memory.
             "terminal_only_active": self._terminal_only_active,
+            # The forced terminal call and what it has spent, so a run picked
+            # up on another pod neither loses the forcing nor restarts its bound.
+            "terminal_call_forced": self._terminal_call_forced,
+            "terminal_call_forced_attempts": self._terminal_call_forced_attempts,
+            "terminal_call_forced_mode": self._terminal_call_forced_mode,
             # Persist "this run delegated" so a run re-driven on another pod
             # still renders its answer the way the pod that dispatched the
             # subtask would have. Same horizontal-scaling rule as the latches
@@ -2633,6 +2777,11 @@ class QueryEngine:
             "live_model_name": self._live_model_name,
             "live_thinking_enabled": self._live_thinking_enabled,
             "live_reasoning_effort": self._live_reasoning_effort,
+            "reasoning_length_cut_count": self._reasoning_length_cut_count,
+            "reasoning_recovery_thinking_enabled": (
+                self._reasoning_recovery_thinking_enabled
+            ),
+            "reasoning_recovery_effort": self._reasoning_recovery_effort,
             "run_settled_emitted": self._run_settled_emitted,
             # Persist the tool-call ledger so a run re-driven on another pod
             # continues one record rather than starting a second. It is the
@@ -2980,6 +3129,10 @@ class QueryEngine:
         restored_observed_prompt_tokens = int(
             snapshot.get("last_observed_prompt_tokens", 0)
         )
+        restored_calibration = snapshot.get("token_estimate_calibration")
+        restored_calibration_model = snapshot.get(
+            "token_estimate_calibration_model"
+        )
         # The run continuity — checkpoint, rules, pins, records. Parsed here for
         # the same reason as the history above: a missing or malformed block
         # must refuse the snapshot with the chain standing where it was, not
@@ -2995,8 +3148,13 @@ class QueryEngine:
         compaction = snapshot.get("compaction", {})
         restored_compaction = CompactionState(
             retry_count=int(compaction.get("retry_count", 0)),
+            reactive_retry_count=int(compaction.get("reactive_retry_count", 0)),
             summarised_turn_ids=set(compaction.get("summarised_turn_ids", [])),
             blob_refs_created=list(compaction.get("blob_refs_created", [])),
+            failed_anchor_keys={
+                str(key): int(count)
+                for key, count in dict(compaction.get("failed_anchor_keys", {})).items()
+            },
         )
 
         # Put the run back on the provider it was demoted to. An unreachable
@@ -3069,6 +3227,14 @@ class QueryEngine:
         # no field present resume as if the nudge had not fired.
         self._terminal_only_active = bool(
             snapshot.get("terminal_only_active", False)
+        )
+        self._terminal_call_forced = bool(snapshot.get("terminal_call_forced", False))
+        self._terminal_call_forced_attempts = int(
+            snapshot.get("terminal_call_forced_attempts", 0) or 0
+        )
+        forced_mode = snapshot.get("terminal_call_forced_mode")
+        self._terminal_call_forced_mode = (
+            forced_mode if isinstance(forced_mode, str) else None
         )
         # Restore the delegation fact. Default False so a snapshot taken before
         # the field existed resumes as a run that never delegated — the
@@ -3307,6 +3473,23 @@ class QueryEngine:
         )
         live_model = snapshot.get("live_model_name")
         self._live_model_name = live_model if isinstance(live_model, str) else None
+        restored_calibration_factor = self._token_estimate_calibration_baseline
+        if (
+            self.config.rc.token_estimate_calibration_enabled
+            and isinstance(restored_calibration_model, str)
+            and restored_calibration_model == self.effective_model_name
+            and isinstance(restored_calibration, int | float)
+            and not isinstance(restored_calibration, bool)
+            and 1.0 <= float(restored_calibration) <= 4.0
+        ):
+            restored_calibration_factor = max(
+                self._token_estimate_calibration_baseline,
+                float(restored_calibration),
+            )
+        self.set_token_estimate_calibration(
+            restored_calibration_factor,
+            model_name=self.effective_model_name,
+        )
         if "live_thinking_enabled" in snapshot:
             thinking_flag = snapshot.get("live_thinking_enabled")
             self._live_thinking_enabled = (
@@ -3318,7 +3501,20 @@ class QueryEngine:
         self._live_reasoning_effort = (
             live_effort if isinstance(live_effort, str) else None
         )
+        self._reasoning_length_cut_count = int(
+            snapshot.get("reasoning_length_cut_count", 0)
+        )
+        recovery_thinking = snapshot.get("reasoning_recovery_thinking_enabled")
+        self._reasoning_recovery_thinking_enabled = (
+            recovery_thinking if isinstance(recovery_thinking, bool) else None
+        )
+        recovery_effort = snapshot.get("reasoning_recovery_effort")
+        self._reasoning_recovery_effort = (
+            recovery_effort if isinstance(recovery_effort, str) else None
+        )
         self._run_settled_emitted = bool(snapshot.get("run_settled_emitted", False))
+        if self.is_terminal:
+            self.reset_reasoning_recovery()
         restored_ledger = snapshot.get("tool_call_ledger") or []
         self._tool_call_ledger = [
             {
@@ -3341,9 +3537,6 @@ class QueryEngine:
         )
         restored_stage = snapshot.get("soft_stop_stage")
         self._soft_stop_stage = restored_stage if isinstance(restored_stage, str) else ""
-        from protocore.runtime import soft_stop as _soft_stop
-
-        _soft_stop.restore(self)
         from protocore.runtime.intent import IntentRecord
         from protocore.runtime.lanes import Lane
         from protocore.runtime.usage_ledger import UsageRow
@@ -3482,13 +3675,27 @@ class QueryEngine:
 
     @property
     def effective_thinking_enabled(self) -> bool:
+        if self._reasoning_recovery_thinking_enabled is not None:
+            return self._reasoning_recovery_thinking_enabled
         if self._live_thinking_enabled is None:
             return self.config.thinking_enabled
         return self._live_thinking_enabled
 
     @property
     def effective_reasoning_effort(self) -> str:
+        if self._reasoning_recovery_effort is not None:
+            return self._reasoning_recovery_effort
         return self._live_reasoning_effort or self.config.reasoning_effort
+
+    def clear_reasoning_recovery_overrides(self) -> None:
+        """Drop temporary reasoning controls without refunding retry budget."""
+        self._reasoning_recovery_thinking_enabled = None
+        self._reasoning_recovery_effort = None
+
+    def reset_reasoning_recovery(self) -> None:
+        """Clear temporary controls and start a fresh retry budget."""
+        self.clear_reasoning_recovery_overrides()
+        self._reasoning_length_cut_count = 0
 
     def apply_live_controls(
         self,
@@ -3509,11 +3716,30 @@ class QueryEngine:
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("invalid_reasoning_effort")
         if model_name is not None:
+            if model_name != self.effective_model_name:
+                self.set_token_estimate_calibration(
+                    self._token_estimate_calibration_baseline,
+                    model_name=model_name,
+                )
             self._live_model_name = model_name
         if thinking_enabled is not None:
             self._live_thinking_enabled = thinking_enabled
         if reasoning_effort is not None:
             self._live_reasoning_effort = reasoning_effort
+
+    def set_token_estimate_calibration(
+        self,
+        factor: float,
+        *,
+        model_name: str,
+    ) -> None:
+        """Bind one adaptive estimate factor to the model that produced it."""
+        calibrated = self.config.rc.model_copy(
+            update={"token_estimate_calibration": factor}
+        )
+        self.config = replace(self.config, rc=calibrated)
+        self.context_manager.update_rc(calibrated)
+        self._token_estimate_calibration_model = model_name
 
     def pin_tool_result(self, tool_call_id: str) -> None:
         self._pinned_tool_result_ids.add(tool_call_id)
@@ -3523,17 +3749,11 @@ class QueryEngine:
         return is_terminal(self.state)
 
     def needs_compaction(self) -> bool:
-        return self.context_manager.needs_compaction(
-            self.history,
-            observed_prompt_tokens=self.last_observed_prompt_tokens,
-        )
+        return self.context_manager.needs_compaction(self.history)
 
     def needs_emergency_compaction(self) -> bool:
         """Return True when history exceeds the emergency cliff (proactive force)."""
-        return self.context_manager.needs_emergency_compaction(
-            self.history,
-            observed_prompt_tokens=self.last_observed_prompt_tokens,
-        )
+        return self.context_manager.needs_emergency_compaction(self.history)
 
     @property
     def last_request_manifest(self) -> dict[str, Any] | None:

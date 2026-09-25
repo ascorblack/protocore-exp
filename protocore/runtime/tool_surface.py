@@ -113,7 +113,8 @@ def read_tool_surface(tools: Sequence[Any]) -> ToolSurface:
             for name, tool in zip(names, tools, strict=True)
         }
         while len(_descriptions) > MAX_TOOL_SURFACE_CACHE_ENTRIES:
-            _descriptions.popitem(last=False)
+            evicted, _ = _descriptions.popitem(last=False)
+            _forget_claims_for(evicted)
     else:
         _descriptions.move_to_end(digest)
     return ToolSurface(digest=digest, names=names, definitions=definitions)
@@ -139,6 +140,21 @@ def tool_surface_tokens(surface: ToolSurface, rc: LoopConstants) -> int:
     while len(_estimates) > MAX_TOOL_SURFACE_CACHE_ENTRIES:
         _estimates.popitem(last=False)
     return total
+
+
+def _forget_claims_for(digest: str) -> None:
+    """Drop every reader's claim on a digest this process can no longer explain.
+
+    A claim says a reader was sent the descriptions and can be left to its own
+    copy. Once the descriptions are evicted, :func:`surface_descriptions` can
+    no longer answer a reader that lost that copy, so the claim is a promise
+    the process has stopped being able to keep: the next advertisement of the
+    digest describes it again rather than naming something nobody can look up.
+    Eviction needs more distinct surfaces than a deployment has, so the scan
+    costs nothing on the path that matters.
+    """
+    for stale in [key for key in _described if key[0] == digest]:
+        del _described[stale]
 
 
 def surface_needs_describing(digest: str, audience: str) -> bool:

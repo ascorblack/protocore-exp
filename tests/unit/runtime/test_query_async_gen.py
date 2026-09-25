@@ -425,8 +425,13 @@ async def test_terminal_nudge_recovers_plain_text_final(
         for evt in events
         if evt.type is EventType.STATE_CHANGED
     ]
-    assert "terminal_tool_nudge" in reasons
-    assert len(in_memory_runtime["llm"].calls) == 2
+    # The plain-text answer is followed by a request that forces the terminal
+    # tool rather than one that asks for it in words.
+    assert "terminal_tool_forced" in reasons
+    assert "terminal_tool_nudge" not in reasons
+    calls = in_memory_runtime["llm"].calls
+    assert len(calls) == 2
+    assert calls[1].extra.get("forced_tool_choice") == "pcm_answer"
     assert tool.calls == [{"message": "14", "outcome": "OUTCOME_OK", "refs": []}]
     assert engine.state is LoopState.COMPLETED
 
@@ -590,6 +595,7 @@ async def test_compaction_uses_rc_for_summary_caps(
 
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
         # Custom caps — values different from defaults so we can assert.
@@ -643,6 +649,7 @@ async def test_compaction_started_payload_uses_correct_threshold(
 
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )
@@ -683,6 +690,7 @@ async def test_compaction_completion_persists_snapshot(
     # Tiny window so a single long message triggers compaction.
     rc = LoopConstants(
         model_context_window=64,
+        request_context_safety_tokens=0,
         compaction_trigger_ratio=0.5,  # 32 tokens trigger
         compaction_keep_recent_turns=1,
         compaction_failed_max_retries=2,
@@ -964,15 +972,21 @@ async def test_compaction_mid_turn(engine_factory, in_memory_runtime) -> None:
     from protocore.contracts.runtime_constants import LoopConstants
 
     rc = LoopConstants(
-        model_context_window=64,
+        model_context_window=4_096,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
     )
     engine = engine_factory(rc=rc)
+    in_memory_runtime["llm"].queue_response(text='{"summary":"old answer"}')
     in_memory_runtime["llm"].queue_response(text="post-compaction reply")
 
-    big_text = "a" * 1024
-    user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text=big_text)])
+    engine.history.append(
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text="a" * 10_000)],
+        )
+    )
+    user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text="continue")])
     events: list[TurnEvent] = []
     async for evt in engine.run(user_msg):
         events.append(evt)

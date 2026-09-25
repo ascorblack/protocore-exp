@@ -185,8 +185,15 @@ Finalization gate (host-owned)
   (`run_tier1_truncation`) truncates / blobs oversized tool results, replacing
   the body with a placeholder + blob ref. **Tier 2**
   (`run_tier2_summarisation`) replaces whole old non-system turns with a system
-  summary, keeping the recent N turns. When both are exhausted,
-  `CompactionExhaustedError` transitions the loop to `FAILED`. Operator
+  summary, keeping the recent N turns. A pass that tried and failed is
+  charged once to a retry budget (`compaction_failed_max_retries`; the
+  reactive pass after a provider rejection has its own), and a proactive pass
+  with nothing eligible is not opened at all. Past the budget
+  `CompactionExhaustedError` on a proactive pass suspends the proactive
+  summariser tiers for a bounded stretch (Tier 1 keeps running; a context
+  refusal, `rearm()` or a snapshot resume ends it sooner); on a reactive pass it
+  hands the turn to the output-cap ladder, and only when no smaller cap is left
+  does the loop go to `FAILED`. Operator
   `/compact` is a separate `CompactCheckpoint` path
   (`runtime/compact_checkpoint.py`, `compaction_manual_enabled` default
   `False`). Cross-run fold lives in `runtime/context/session_memory.py`

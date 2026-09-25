@@ -113,6 +113,7 @@ protocore/contracts/
 |---|---|---|
 | `ILLMProvider` | `contracts/llm.py` | LLM-завершения: `stream_with_tools`, `complete_structured` (после цикла, JSON-схема), `complete_text` (после цикла, свободный документ) и `count_tokens`; универсальный LiteLLM/OpenAI-совместимый адаптер (OpenRouter / vLLM / OpenAI). |
 | `IProviderChain` | `contracts/llm.py` | Упорядоченные оставшиеся провайдеры плюс односторонний курсор `advance()`. `QueryEngine` внедряет его как `provider_chain` для mid-stream failover; `None` оставляет существующее восстановление нетронутым. Не входит в `protocore.contracts.__all__` — импортируйте из `protocore.contracts.llm`. |
+| `IRequestTokenCounter` | `contracts/llm.py` | Необязательная возможность провайдера: `async count_request_tokens(request) -> int \| None` — сколько токенов промпта сервер получит из запроса (сообщения через его чат-шаблон, инструменты, промпт генерации). Вызывается только у предела (`exact_token_count_margin_ratio`); `None` значит «здесь посчитать нельзя», исключение — откат к оценке с предупреждением. Ищется на классе провайдера, так что провайдер без неё не затронут. |
 | `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Потенантные `LoopConstants` (`async get(tenant_id)`), на базе Postgres с Redis-кэшем. |
 | `ISessionStore` | `contracts/session.py` | Хранение сессий / транскриптов. |
 | `IRunStore` | `contracts/run.py` | Создание / список / чтение записей запусков (долговечная строка + горячая запись). |

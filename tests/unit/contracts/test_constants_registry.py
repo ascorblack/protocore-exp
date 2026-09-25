@@ -238,6 +238,10 @@ def _declared_values(**delta: object) -> dict[str, object]:
 #: the constant on its own — only the relationship refuses it.
 REFUSED_VALUES: tuple[tuple[str, dict[str, object]], ...] = (
     ("loop.compaction_trigger_below_emergency", {"compaction_trigger_ratio": 0.95}),
+    (
+        "loop.request_context_safety_below_window",
+        {"request_context_safety_tokens": 49_152},
+    ),
     ("loop.overhead_leaves_room_for_history", {"system_prompt_max_ratio": 0.9}),
     ("loop.stall_below_idle", {"llm_stream_stall_threshold_seconds": 90.0}),
     ("loop.reasoning_idle_only_widens", {"llm_stream_reasoning_idle_timeout_seconds": 89.0}),
@@ -536,6 +540,130 @@ class TestLoopGroup:
         assert spec.exclusive_minimum is True
         assert spec.maximum == 1.0
 
+    def test_context_overflow_retry_ratio_has_open_bounds(self) -> None:
+        spec = build_loop_group().spec("context_overflow_retry_output_ratio")
+        assert spec.default == 0.5
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is True
+        assert spec.maximum == 1.0
+        assert spec.exclusive_maximum is True
+
+    def test_forced_compaction_keep_window_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_force_keep_recent_turns")
+        assert spec.default == 1
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is True
+        assert spec.kind == "int"
+
+    def test_stale_result_trimming_is_off_until_a_deployment_asks(self) -> None:
+        # It shrinks the request before compaction has to run, which is a
+        # choice about how much evidence the model still sees — not a default
+        # an existing deployment inherits on an upgrade.
+        spec = build_loop_group().spec("tool_result_stale_trim_enabled")
+        assert spec.default is False
+        assert spec.kind == "bool"
+
+    def test_the_stale_trim_window_and_head_are_dashboard_configurable(self) -> None:
+        fresh = build_loop_group().spec("tool_result_fresh_count")
+        assert fresh.default == 6
+        assert fresh.minimum == 0.0
+        assert fresh.exclusive_minimum is False
+        assert fresh.kind == "int"
+        head = build_loop_group().spec("tool_result_stale_max_chars")
+        assert head.default == 2000
+        assert head.minimum == 0.0
+        assert head.exclusive_minimum is True
+        assert head.kind == "int"
+
+    def test_the_stale_trim_batch_threshold_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("tool_result_stale_trim_batch_chars")
+        assert spec.default == 40000
+        assert spec.minimum == 0.0
+        assert spec.exclusive_minimum is False
+        assert spec.kind == "int"
+
+    def test_the_lines_a_trim_carries_over_are_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("tool_result_stale_trim_protected_prefixes")
+        assert spec.default == "Cite exactly:,Cite:,cite_as:,Source:"
+        assert spec.kind == "str"
+
+    def test_exact_token_counting_is_dashboard_configurable(self) -> None:
+        group = build_loop_group()
+        enabled = group.spec("exact_token_count_enabled")
+        assert enabled.default is True and enabled.kind == "bool"
+        margin = group.spec("exact_token_count_margin_ratio")
+        assert margin.default == 0.75
+        assert margin.minimum == 0.0 and margin.maximum == 1.0
+        cache = group.spec("exact_token_count_cache_max_entries")
+        assert cache.default == 32 and cache.kind == "int"
+        assert cache.exclusive_minimum is True
+        timeout = group.spec("exact_token_count_timeout_seconds")
+        assert timeout.default == 5.0 and timeout.kind == "float"
+        assert timeout.exclusive_minimum is True
+        backoff = group.spec("exact_token_count_failure_backoff_seconds")
+        assert backoff.default == 300.0 and backoff.kind == "float"
+        assert backoff.minimum == 0.0 and backoff.exclusive_minimum is False
+
+    def test_context_overflow_retry_attempt_bound_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("context_overflow_retry_max_attempts")
+        assert spec.default == 13
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
+    def test_compaction_trigger_turn_headroom_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_trigger_turn_headroom_ratio")
+        assert spec.default == 0.15
+        assert spec.minimum == 0.0
+        assert spec.maximum == 1.0
+        assert spec.exclusive_maximum is True
+        assert spec.kind == "float"
+
+    def test_summary_output_cost_per_word_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_output_tokens_per_word")
+        assert spec.default == 4
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
+    def test_failed_unit_attempt_bound_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_failed_unit_max_attempts")
+        assert spec.default == 2
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
+    def test_backoff_growth_bound_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_no_gain_backoff_growth_ratio")
+        assert spec.default == 0.1
+        assert spec.minimum == 0.0 and spec.exclusive_minimum is True
+        assert spec.kind == "float"
+
+    def test_proactive_suspension_bounds_are_dashboard_configurable(self) -> None:
+        group = build_loop_group()
+        visits = group.spec("compaction_proactive_suspension_iterations")
+        assert visits.default == 6
+        assert visits.minimum == 1.0
+        assert visits.kind == "int"
+        growth = group.spec("compaction_proactive_suspension_growth_ratio")
+        assert growth.default == 0.1
+        assert growth.minimum == 0.0 and growth.exclusive_minimum is True
+        assert growth.kind == "float"
+
+    def test_summary_chars_per_word_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_chars_per_word")
+        assert spec.default == 6
+        assert spec.minimum == 1.0
+        assert spec.kind == "int"
+
+    def test_output_reserve_gate_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("provider_reserves_output_in_context_window")
+        assert spec.default is True
+        assert spec.kind == "bool"
+
+    def test_summary_envelope_allowance_is_dashboard_configurable(self) -> None:
+        spec = build_loop_group().spec("compaction_summary_envelope_tokens")
+        assert spec.default == 32
+        assert spec.minimum == 0.0
+        assert spec.kind == "int"
+
     def test_a_constant_without_a_bound_has_none(self) -> None:
         spec = build_loop_group().spec("continue_prompt_text")
         assert spec.minimum is None and spec.maximum is None
@@ -685,6 +813,17 @@ class TestOneValueAgainstItsOwnDescriptor:
     def test_a_value_over_its_ceiling_is_refused(self) -> None:
         with pytest.raises(ConstantValueError, match=r"must be <= 1\.0"):
             build_loop_group().spec("compaction_trigger_ratio").validate_value(2.0)
+
+    @pytest.mark.parametrize("value", [0.0, 1.0])
+    def test_context_overflow_retry_ratio_refuses_closed_boundaries(
+        self, value: float
+    ) -> None:
+        with pytest.raises(ValueError):
+            LoopConstants(context_overflow_retry_output_ratio=value)
+        with pytest.raises(ConstantValueError):
+            build_loop_group().spec(
+                "context_overflow_retry_output_ratio"
+            ).validate_value(value)
 
     def test_a_value_outside_the_enumeration_is_refused(self) -> None:
         with pytest.raises(ConstantValueError, match="is not one of"):

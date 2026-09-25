@@ -110,6 +110,7 @@ concrete adapter. Each is one line: the contract and what a host supplies.
 |---|---|---|
 | `ILLMProvider` | `contracts/llm.py` | LLM completions: `stream_with_tools`, `complete_structured` (post-loop JSON schema), `complete_text` (post-loop free-form document), and `count_tokens`; a universal LiteLLM/OpenAI-compatible adapter (OpenRouter / vLLM / OpenAI). |
 | `IProviderChain` | `contracts/llm.py` | Ordered remaining providers plus a one-way `advance()` cursor. `QueryEngine` injects it as `provider_chain` for mid-stream failover; `None` leaves existing recovery untouched. Not in `protocore.contracts.__all__` — import from `protocore.contracts.llm`. |
+| `IRequestTokenCounter` | `contracts/llm.py` | Optional provider capability: `async count_request_tokens(request) -> int \| None`, the prompt tokens the server renders the request to (messages through its chat template, tools, generation prompt). Asked only near a limit (`exact_token_count_margin_ratio`); `None` means "cannot count here", a raise falls back to the estimate with a warning. Looked up on the provider's class, so a provider without it is unaffected. |
 | `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Per-tenant `LoopConstants` (`async get(tenant_id)`), Postgres-backed with a Redis cache. |
 | `ISessionStore` | `contracts/session.py` | Session / transcript persistence. |
 | `IRunStore` | `contracts/run.py` | Run record create / list / read (durable row + hot record). |

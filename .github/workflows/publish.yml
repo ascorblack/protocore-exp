@@ -8,8 +8,8 @@ name: Publish
 # publisher:
 #
 #   PyPI project name : protocore
-#   Owner             : ascorblack-labs
-#   Repository name   : protocore-community
+#   Owner             : anchor-inference
+#   Repository name   : protocore
 #   Workflow name     : publish.yml
 #   Environment name  : pypi
 #

@@ -34,6 +34,7 @@ from protocore.contracts.llm import LLMRequest, LLMStreamEvent
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SESSION_HISTORY_SEED_METADATA_KEY,
+    SYNTHETIC_RECOVERY_BACKGROUND_WAKE,
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
     TERMINAL_TOOL_METADATA_KEY,
@@ -75,6 +76,9 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
     "test_prose_gate_reads_the_tail_and_not_a_seeded_turn": (
         "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected",
     ),
+    "test_produced_output_ignores_a_seeded_prior_run": (
+        "protocore/runtime/query.py::_run_produced_output",
+    ),
     "test_call_id_lookups_resolve_the_call_they_are_asked_for": (
         "protocore/runtime/query.py::_tool_name_for_call_id",
         "protocore/runtime/query.py::_history_has_tool_result",
@@ -89,9 +93,6 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
     ),
     "test_active_file_tail_needs_this_runs_own_binding": (
         "protocore/runtime/longfile_convergence.py::_active_file_tail",
-    ),
-    "test_produced_output_is_about_the_round_now_driving": (
-        "protocore/runtime/query.py::_this_round_messages",
     ),
     "test_seed_indices_select_every_seeded_turn_and_nothing_else": (
         "protocore/runtime/context/compaction.py::_session_history_seed_indices",
@@ -248,52 +249,86 @@ def test_prose_gate_reads_the_tail_and_not_a_seeded_turn(engine_factory) -> None
     assert _prose_gate_just_injected(engine) is False
 
 
-def test_produced_output_is_about_the_round_now_driving(engine_factory) -> None:
-    """A previous run's work is not this run's evidence.
+def test_produced_output_ignores_a_seeded_prior_run(engine_factory) -> None:
+    """Work a PREVIOUS run did is not work this one can be asked to report on.
 
-    Its registry reason is that the question starts after the last message a
-    caller put in. Widen it to the whole transcript and a session that has ever
-    answered anything reads as a run that has produced something — so a run
-    whose very first request the provider refused would be wound down and asked
-    to summarise, and it would summarise the previous run's work as its own.
+    Its registry reason is that the walk starts after the last caller message,
+    which the seed always precedes. Widen it to the whole transcript and a
+    session whose earlier run answered makes every later run look productive —
+    so a run whose first request the endpoint refused is wound down and told to
+    write a closing summary, and it summarises the previous run's work as its
+    own.
     """
     engine: QueryEngine = engine_factory()
-    prior_work = [
-        _seeded(_user(_PRIOR_TASK)),
-        _seeded(_assistant(TextBlock(text="Here is the retrospective."))),
-    ]
+    prior_answer = _assistant(TextBlock(text="The retrospective is attached."))
 
-    engine.history = [*prior_work, _user(_NEW_TASK)]
+    engine.history = [_seeded(_user(_PRIOR_TASK)), _seeded(prior_answer), _user(_NEW_TASK)]
     assert _run_produced_output(engine) is False
 
-    # A prior run left verbatim, without the executor's tag: still not this run's.
-    engine.history = [
-        _user(_PRIOR_TASK),
-        _assistant(TextBlock(text="Here is the retrospective.")),
-        _user(_NEW_TASK),
-    ]
+    engine.history = [*engine.history, _assistant(TextBlock(text="Reading the plan now."))]
+    assert _run_produced_output(engine) is True
+
+
+def test_produced_output_is_output_and_not_merely_a_turn(engine_factory) -> None:
+    """Prose, a tool call or a tool result count; an empty turn does not.
+
+    The predicate gates the wind-down, and a wind-down is a request for the
+    best answer the evidence supports. An assistant turn carrying nothing but
+    whitespace is not evidence of anything, and a synthetic recovery turn the
+    runtime itself wrote is not a caller message, so it must not be mistaken
+    for one and move the boundary past the work that precedes it.
+    """
+    engine: QueryEngine = engine_factory()
+
+    engine.history = [_user(_NEW_TASK), _assistant(TextBlock(text="   "))]
     assert _run_produced_output(engine) is False
 
-    # The wind-down's own notice is the runtime's words, not a caller's, so it
-    # does not move the boundary past the work it follows.
     engine.history = [
         _user(_NEW_TASK),
-        _assistant(TextBlock(text="Reading the plan now.")),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+    ]
+    assert _run_produced_output(engine) is True
+
+    engine.history = [
+        _user(_NEW_TASK),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="call-1", content="42 lines", is_error=False)
+            ],
+        ),
         Message(
             role=MessageRole.user,
-            content_blocks=[TextBlock(text="wrap up")],
-            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: "soft_stop"},
+            content_blocks=[TextBlock(text="wrap up now")],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR},
         ),
     ]
     assert _run_produced_output(engine) is True
 
-    engine.history = [*prior_work, _user(_NEW_TASK), _assistant(TextBlock(text="  "))]
-    assert _run_produced_output(engine) is False  # whitespace is not a word
 
+def test_a_background_wake_message_does_not_move_the_output_boundary(engine_factory) -> None:
+    """The wake-up the runtime writes when background tasks finish is scaffolding.
+
+    It is a user-role message, so anchoring on "the caller's last message"
+    would restart the boundary at it and judge a run that already read
+    evidence to have produced nothing — the exact case the wind-down protects.
+    """
+    engine: QueryEngine = engine_factory()
     engine.history = [
-        *prior_work,
         _user(_NEW_TASK),
-        _assistant(ToolUseBlock(tool_call_id="toolu_1", name="Read", arguments_json="{}")),
+        _assistant(ToolUseBlock(tool_call_id="call-1", name="Read", arguments_json="{}")),
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(tool_call_id="call-1", content="42 lines", is_error=False)
+            ],
+        ),
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text="background tasks finished: build ok")],
+            metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_BACKGROUND_WAKE},
+        ),
     ]
     assert _run_produced_output(engine) is True
 

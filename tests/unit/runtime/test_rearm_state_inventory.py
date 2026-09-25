@@ -47,6 +47,12 @@ from ._tool_fixtures import MockTool
 # "I thought about it" the thing that fails, not the thing that is assumed.
 _RESET_ON_REARM: frozenset[str] = frozenset(
     {
+        # Proactive compaction's own memory: a suspension waiting for a
+        # rejection, and the last probe that found nothing to do. The next
+        # question starts with a fresh budget, so both start over with it.
+        "_proactive_suspension_gates_left",
+        "_proactive_suspension_prompt_tokens",
+        "_idle_compaction_probe",
         # The state machine and the run's own totals.
         "state",
         "turn_count",
@@ -54,9 +60,6 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_run_started_monotonic",
         "_run_started_epoch",
         "_run_settled_emitted",
-        # The knobs a cut retry turned down are put back by the round that
-        # follows; a turn opened elsewhere starts from the operator's values.
-        "_reasoning_cut_saved",
         "_tool_call_ledger",
         "_tool_call_ledger_seq",
         "_tool_call_ledger_truncated",
@@ -69,10 +72,19 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_soft_stop_cause",
         "_soft_stop_stage",
         "_terminal_only_active",
+        # The terminal call forced after a delivered answer, and its bound:
+        # both belong to the answer that armed them.
+        "_terminal_call_forced",
+        "_terminal_call_forced_attempts",
+        "_terminal_call_forced_mode",
         # Per-turn wire and streaming bookkeeping. ``turn_id()`` is built from
         # the round counter, so a turn opened on a stale one mints ids that
         # collide with the previous turn's.
         "_block_idx",
+        # The size of the request last sent, read only by a rejection of that
+        # same request.
+        "_last_dispatched_prompt",
+        "_exact_count_model",
         "_wire_round_seq",
         "_pending_tool_call_names",
         "_pending_interrupts",
@@ -84,7 +96,13 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         # Recovery budgets. Each bounds one failure mode within one question;
         # an exhausted budget carried forward is a turn that gets no attempt.
         "_compaction_attempted_for_current_turn",
+        "_reactive_compaction_attempted_for_current_turn",
+        "_proactive_compaction_attempted_for_next_message",
+        "_last_fitted_request_max_tokens",
+        "_context_overflow_retry_max_tokens",
+        "_context_overflow_corrective_retry_count",
         "compaction_backoff_left",
+        "compaction_backoff_prompt_tokens",
         "_max_output_recovery_count",
         "_terminal_backstop_turn_active",
         "_tool_call_truncated_recovery_count",
@@ -92,9 +110,12 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_truncation_recovery_prompt_counts",
         "_provider_chain_advances",
         "_consecutive_empty_responses",
+        "_reasoning_length_cut_count",
         "_post_tool_empty_nudge_count",
         "_transient_stream_retry_count",
         "_empty_completion_redrive_count",
+        "_reasoning_recovery_thinking_enabled",
+        "_reasoning_recovery_effort",
         # Fire-once report that the session's background pool cannot speak for
         # the session. A run re-armed onto a pool that is still detached is
         # entitled to be told again.
@@ -301,6 +322,22 @@ def test_rearm_keeps_every_attribute_it_preserves(engine_factory) -> None:
         name for name in QueryEngine._REARM_PRESERVED_ATTRS if getattr(engine, name) is not before[name]
     )
     assert not replaced, f"rearm discarded continuity it must carry forward: {replaced}"
+
+
+def test_a_trimmed_result_stays_trimmed_across_a_rearm(engine_factory) -> None:
+    """The set is what keeps the prompt prefix still, so a turn may not clear it.
+
+    Cleared at a turn boundary, every result the request view had already cut
+    comes back whole on the next build and is cut again on the one after —
+    which is the cache miss the batching exists to avoid, paid twice per turn.
+    """
+    engine = engine_factory()
+    engine._trimmed_tool_result_ids = frozenset({"toolu_1"})
+    _spend_a_turn(engine)
+
+    engine.rearm()
+
+    assert engine._trimmed_tool_result_ids == frozenset({"toolu_1"})
 
 
 # ── what the gaps did to a living agent ─────────────────────────────────────

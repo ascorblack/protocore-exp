@@ -139,6 +139,19 @@ class StopReason(StrEnum):
 TERMINAL_TOOL_METADATA_KEY = "protocore.terminal_tool"
 """ToolResult metadata flag that marks a successful tool as loop-terminal."""
 
+TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY = "protocore.terminal_refusal_needs_work"
+"""ToolResult metadata flag (bool) on an ERROR result of the run's terminal tool.
+
+``True`` says the call was refused because work the answer depends on is
+missing — a declared file that does not exist, a check that has not run — and
+not because of the call itself. It is what lets a run whose terminal call is
+being forced after its answer take one turn of real work: the next request
+requires a tool call of any kind instead of naming the terminal tool. Any other
+terminal-tool error, such as an argument or validation error, is answered by
+forcing the terminal tool again by name. Set only by the terminal tool (or the
+host check behind it); absent means ``False``.
+"""
+
 TOOL_RESULT_COUNT_AS_ERROR_METADATA_KEY = "protocore.count_as_tool_error"
 """ToolResult metadata flag (bool) gating the per-run ``tool_errors_count``.
 
@@ -220,8 +233,10 @@ SYNTHETIC_RECOVERY_MAX_OUTPUT_CONTINUE = "max_output_token_recovery"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for max-output resume user nudges."""
 
 SYNTHETIC_RECOVERY_THINKING_CONTINUE = "thinking_continue_prompt"
-SYNTHETIC_RECOVERY_REASONING_CUT = "reasoning_length_cut_nudge"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for thinking-only continue nudges."""
+
+SYNTHETIC_RECOVERY_REASONING_CUT = "reasoning_length_cut_nudge"
+"""``SYNTHETIC_RECOVERY_METADATA_KEY`` value for a reasoning length-cut nudge."""
 
 SYNTHETIC_RECOVERY_PRE_TERMINAL_SELF_VERIFY = "pre_terminal_self_verify"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for pre-terminal self-verify nudges."""
@@ -244,6 +259,11 @@ SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY = "pre_dispatch_terminal_verify"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for pre-dispatch terminal verification."""
 
 SYNTHETIC_RECOVERY_CIRCUIT_BREAKER = "tool_error_circuit_breaker"
+
+#: The wake-up the runtime appends when background tasks finish mid-run. It is
+#: scaffolding the loop wrote for itself, not a caller turn, so nothing that
+#: anchors on "the caller's last message" may treat it as one.
+SYNTHETIC_RECOVERY_BACKGROUND_WAKE = "background_tasks_finished"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for the repeated-tool-error
 circuit-breaker corrective turn — injected ONCE when a tool crosses
 ``LoopConstants.max_consecutive_tool_errors`` consecutive failures of the same
@@ -1539,6 +1559,7 @@ class SubagentTask(BaseModel):
 
 
 __all__ = [
+    "TERMINAL_REFUSAL_NEEDS_WORK_METADATA_KEY",
     "TERMINAL_TOOL_METADATA_KEY",
     "TERMINAL_TOOL_STATUS_COMPLETED",
     "TERMINAL_TOOL_STATUS_METADATA_KEY",

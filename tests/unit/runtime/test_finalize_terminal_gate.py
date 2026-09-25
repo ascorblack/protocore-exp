@@ -229,15 +229,19 @@ async def test_prose_attempt_is_repaired_into_finalize() -> None:
     )
     events = [evt async for evt in engine.run(initial)]
 
-    # The nudge fired BEFORE the Finalize turn (proves the prose attempt was the
+    # The forcing started BEFORE the Finalize turn (proves the prose attempt was the
     # first turn and did NOT complete the run on its own).
     reasons = [
         e.payload.get("reason")
         for e in events
         if e.type.value == "state_changed"
     ]
-    assert "terminal_tool_nudge" in reasons
+    assert "terminal_tool_forced" in reasons
     assert len(llm.calls) == 2, "prose turn + forced Finalize turn"
+    # The second request names Finalize natively and adds nothing to the
+    # transcript: the delivered answer is its last message.
+    assert llm.calls[1].extra.get("forced_tool_choice") == "Finalize"
+    assert llm.calls[1].messages[-1].role is MessageRole.assistant
     # The gate forced the Finalize round-trip.
     assert finalize_tool.calls, "the gate must force a Finalize call"
     assert engine.state is LoopState.COMPLETED

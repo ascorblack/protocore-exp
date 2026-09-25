@@ -1200,7 +1200,16 @@ async def test_the_summariser_is_asked_for_a_word_budget_that_follows_the_unit()
         model_name="mock",
     )
 
-    expected = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
+    scaled = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
+    # The budget follows the unit until one of the caps on what the reply may
+    # hold takes over: the output cap less its envelope, and the grammar's own
+    # maxLength on the summary string.
+    expected = min(
+        scaled,
+        (rc.compaction_summary_max_output_tokens - rc.compaction_summary_envelope_tokens)
+        // rc.compaction_summary_output_tokens_per_word,
+        rc.compaction_summary_string_max_chars // rc.compaction_summary_chars_per_word,
+    )
     assert f"at most {expected} words" in llm.calls[0].messages[0].text
 
 
@@ -1423,6 +1432,49 @@ async def test_tier3_never_folds_a_turn_seeded_from_an_earlier_run() -> None:
     assert all(
         message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True for message in history[:6]
     )
+
+
+@pytest.mark.asyncio
+async def test_reactive_fold_splits_seeded_and_current_provenance() -> None:
+    """A fold never merges messages that the persistence filter treats differently."""
+    rc = _fold_rc(
+        compaction_keep_recent_turns=1,
+        compaction_fold_min_messages=2,
+        compaction_fold_keep_operator_turns=0,
+    )
+    seeded = [
+        _summary_message(f"seed summary {index} " * 20, f"seed-{index}").model_copy(
+            update={
+                "metadata": {
+                    COMPACTION_SUMMARY_METADATA_KEY: True,
+                    SESSION_HISTORY_SEED_METADATA_KEY: True,
+                }
+            }
+        )
+        for index in range(2)
+    ]
+    current = [
+        _summary_message(f"current summary {index} " * 20, f"current-{index}")
+        for index in range(2)
+    ]
+    history = [*seeded, *current, _assistant("recent")]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "seed fold"}))
+    llm.queue_response(text=json.dumps({"summary": "current fold"}))
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+        compact_seeded_history=True,
+    )
+
+    assert result.spans_folded == 2
+    assert history[0].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True
+    assert history[1].metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
+    assert history[2].text == "recent"
 
 
 @pytest.mark.asyncio

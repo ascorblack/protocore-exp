@@ -582,6 +582,14 @@ GROUP_INVARIANTS: Mapping[str, tuple[GroupInvariant, ...]] = {
             predicate=lambda v: v["compaction_trigger_ratio"] < v["compaction_emergency_ratio"],
         ),
         GroupInvariant(
+            key="loop.request_context_safety_below_window",
+            fields=("request_context_safety_tokens", "model_context_window"),
+            message="request_context_safety_tokens must be < model_context_window",
+            predicate=lambda v: (
+                v["request_context_safety_tokens"] < v["model_context_window"]
+            ),
+        ),
+        GroupInvariant(
             key="loop.overhead_leaves_room_for_history",
             fields=_OVERHEAD_RATIO_FIELDS,
             message="system + skill + tool + user budgets must sum to < 1.0",

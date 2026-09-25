@@ -576,8 +576,11 @@ async def test_salvage_then_clean_append_reaches_finalize() -> None:
     truncated-tail flag, so the file becomes ``plausibly_complete`` and a
     subsequent idle stall reaches the FinalizeFile path. Proves the re-set blocks
     finalize ONLY on the salvage-tail itself, never permanently."""
+    # A wider window than the rest of this module: two floors of content plus a
+    # clean append is a history the compaction trigger would otherwise sit
+    # under, and this test is about the convergence driver, not compaction.
     rc = LoopConstants(
-        model_context_window=8_192,
+        model_context_window=32_768,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
         longfile_expected_floor_bytes=4096,

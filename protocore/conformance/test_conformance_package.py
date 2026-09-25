@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+import protocore.conformance as conformance_package
 import protocore.contracts as contracts_package
 from protocore.conformance import SUITES, ContractSuite, binds_a_subject, bound_suites
 from protocore.conformance.suite import _protocol_member, declared_members
@@ -98,6 +99,38 @@ def test_every_declared_contract_has_a_suite() -> None:
 def test_each_suite_names_a_distinct_contract() -> None:
     protocols = [suite.protocol for suite in SUITES]
     assert len(set(protocols)) == len(protocols)
+
+
+def test_every_suite_is_importable_from_the_package() -> None:
+    # A host imports suites from ``protocore.conformance``; one listed in
+    # SUITES but not re-exported there is reachable only by a private path.
+    exported = set(conformance_package.__all__)
+    namespace = vars(conformance_package)
+    missing = sorted(
+        suite.__name__
+        for suite in SUITES
+        if suite.__name__ not in exported or namespace.get(suite.__name__) is not suite
+    )
+    assert missing == [], (
+        f"these suites are not re-exported by protocore.conformance: {missing}. "
+        "Import them in protocore/conformance/__init__.py and list them in __all__."
+    )
+
+
+def test_every_suite_class_in_the_suites_module_is_listed() -> None:
+    from protocore.conformance import suites as suites_module
+
+    defined = {
+        obj
+        for obj in vars(suites_module).values()
+        if inspect.isclass(obj)
+        and issubclass(obj, ContractSuite)
+        and obj is not ContractSuite
+    }
+    assert defined - set(SUITES) == set(), (
+        "these suite classes are defined but missing from SUITES: "
+        f"{sorted(cls.__name__ for cls in defined - set(SUITES))}"
+    )
 
 
 def test_each_suite_is_a_contract_suite_and_says_what_it_is_for() -> None:

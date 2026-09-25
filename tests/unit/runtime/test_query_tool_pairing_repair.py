@@ -1279,20 +1279,21 @@ async def test_hook_denied_teardown_pairs_dangling_tool_use(
 
 
 @pytest.mark.asyncio
-async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
+async def test_routine_compaction_exhaustion_leaves_a_pairing_valid_history(
     engine_factory: Any,
     in_memory_runtime: dict[str, Any],
 ) -> None:
-    """A compaction-exhausted FAILED terminal leaves a pairing-valid history.
+    """Routine exhaustion suspends compaction; whatever ends the run pairs the call.
 
-    Drives the routine-compaction CompactionExhaustedError path (which
-    transitions to FAILED in ``_run_compaction`` and lets ``query()`` emit
-    the terminal message_stop) and asserts the dangling tool_use is paired.
+    A proactive pass out of budget no longer fails the run by itself — nothing
+    has been rejected yet — so the run goes on, and the terminal it reaches
+    must still leave the dangling tool_use paired.
     """
     from protocore.runtime.context.compaction import CompactionExhaustedError
 
-    # Force compaction to trigger then fail.
-    engine = engine_factory(rc=LoopConstants(model_context_window=64))
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=64, request_context_safety_tokens=0)
+    )
     engine.history.append(
         Message(
             role=MessageRole.assistant,
@@ -1308,7 +1309,9 @@ async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
         raise CompactionExhaustedError("no room")
 
     engine.context_manager.run_compaction = _boom  # type: ignore[method-assign]
-    # Make needs_compaction return True deterministically.
+    engine.context_manager.has_proactive_work = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: True
+    )
     engine.needs_compaction = lambda: True  # type: ignore[method-assign,assignment]
 
     events: list[TurnEvent] = []
@@ -1316,7 +1319,12 @@ async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
     async for evt in engine.run(user_msg):
         events.append(evt)
 
-    assert engine.state is LoopState.FAILED
+    reasons = [
+        evt.payload.get("reason") for evt in events if evt.type is EventType.STATE_CHANGED
+    ]
+    assert "compaction_exhausted_proactive_suspended" in reasons
+    assert engine.proactive_compaction_suspended is True
+    assert engine.is_terminal
     assert "compact_call" in _tool_result_ids(list(engine.history))
 
 

@@ -59,6 +59,7 @@ from protocore.contracts.hooks import (
 )
 from protocore.contracts.llm import (
     ILLMProvider,
+    IRequestTokenCounter,
     LLMContextWindowExceeded,
     LLMError,
     LLMObservabilityContext,
@@ -249,6 +250,7 @@ __all__ = [
     "ILifecycleRegistry",
     "IMemory",
     "IPromptTemplateProvider",
+    "IRequestTokenCounter",
     "IResilienceClassifier",
     "IRunStore",
     "ISearchIndex",

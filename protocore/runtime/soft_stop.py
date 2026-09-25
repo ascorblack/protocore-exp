@@ -77,7 +77,6 @@ CAUSE_MAX_TURNS: Final[str] = "max_turns"
 CAUSE_OUTPUT_TOKEN_BUDGET: Final[str] = "output_token_budget"
 CAUSE_DEADLINE: Final[str] = "deadline"
 CAUSE_PROVIDER_ERROR: Final[str] = "provider_error"
-CAUSE_MODEL_NO_PROGRESS: Final[str] = "model_no_progress"
 
 CAUSES: Final[frozenset[str]] = frozenset(
     {
@@ -86,7 +85,6 @@ CAUSES: Final[frozenset[str]] = frozenset(
         CAUSE_OUTPUT_TOKEN_BUDGET,
         CAUSE_DEADLINE,
         CAUSE_PROVIDER_ERROR,
-        CAUSE_MODEL_NO_PROGRESS,
     }
 )
 
@@ -223,15 +221,14 @@ def restricted_policy(
 def notification_text(engine: QueryEngine, *, cause_name: str) -> str:
     """The notice this cause puts in front of the model.
 
-    The wind-down is one path for five bounds, and the notice used to be one
-    text for all five — which made it say "the run has reached its budget" to a
-    run whose budget was untouched: the upstream had refused every request and
-    the retries were spent. A model reads that literally. It infers that it was
-    given turns and spent them, and it writes a closing summary of work it
+    The wind-down is one path for several bounds, and the notice used to be one
+    text for all of them — which made it say "the run has reached its budget"
+    to a run whose budget was untouched: the upstream had refused its requests
+    and the retries were spent. A model reads that literally. It infers that it
+    was given turns and spent them, and it writes a closing summary of work it
     never did; the operator gets a polite report of nothing and no sign that
-    the provider failed. So a cause that is not a budget names itself, and the
-    three that really are budgets — the tool-call budget, the turn cap, the
-    output-token budget — keep the general text.
+    the provider failed. So the cause that is not a budget names itself, and
+    the ones that really are budgets keep the general text.
 
     A cause whose own text is blank falls back to the general one. An empty
     general notice suppresses the message entirely, which is what its constant
@@ -240,10 +237,6 @@ def notification_text(engine: QueryEngine, *, cause_name: str) -> str:
     rc = engine.config.rc
     if cause_name == CAUSE_PROVIDER_ERROR:
         template = rc.soft_stop_notice_text_provider_error or rc.soft_stop_notice_text
-    elif cause_name == CAUSE_MODEL_NO_PROGRESS:
-        template = rc.soft_stop_notice_text_model_no_progress or rc.soft_stop_notice_text
-    elif cause_name == CAUSE_DEADLINE:
-        template = rc.soft_stop_notice_text_deadline or rc.soft_stop_notice_text
     else:
         template = rc.soft_stop_notice_text
     if not template:
@@ -272,7 +265,16 @@ def enter(engine: QueryEngine, *, cause_name: str, detail: str = "") -> list[Tur
 
     engine._soft_stop_cause = cause_name
     engine._soft_stop_stage = STAGE_NOTIFIED
-    _append_notice(engine, cause_name=cause_name)
+
+    text = notification_text(engine, cause_name=cause_name)
+    if text:
+        engine.history.append(
+            Message(
+                role=MessageRole.user,
+                content_blocks=[TextBlock(text=text)],
+                metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_SOFT_STOP},
+            )
+        )
 
     allowed = terminal_surface(engine)
     extra: dict[str, object] = {"soft_stop_detail": detail} if detail else {}
@@ -299,62 +301,6 @@ def enter(engine: QueryEngine, *, cause_name: str, detail: str = "") -> list[Tur
         ",".join(sorted(allowed)) or "-",
     )
     return events
-
-
-def _has_notice(engine: QueryEngine) -> bool:
-    from protocore.runtime.query import _this_run_messages
-
-    key = SYNTHETIC_RECOVERY_METADATA_KEY
-    return any(m.metadata.get(key) == SYNTHETIC_RECOVERY_SOFT_STOP for m in _this_run_messages(engine))
-
-
-def _append_notice(engine: QueryEngine, *, cause_name: str) -> None:
-    text = notification_text(engine, cause_name=cause_name)
-    if text:
-        engine.history.append(
-            Message(
-                role=MessageRole.user,
-                content_blocks=[TextBlock(text=text)],
-                metadata={SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_SOFT_STOP},
-            )
-        )
-
-
-def restore(engine: QueryEngine) -> None:
-    """Put the notification back in front of a resumed run that is still wound down.
-
-    The wind-down state travels in the snapshot; the notice travels in history
-    only while the run drives (see :func:`leave`). A run resumed from a snapshot
-    taken after its end is still bound — its surface is empty — and the model
-    must read why, or it meets an empty surface with no explanation.
-    """
-    if is_armed(engine) and not _has_notice(engine):
-        _append_notice(engine, cause_name=cause(engine) or "")
-
-
-def leave(engine: QueryEngine) -> int:
-    """Take the notification out of history once the run is over. Returns how many were removed.
-
-    The notice is an instruction for the run it was written into: "the tools are
-    gone, write your answer now". It is true only while that run drives. Left in
-    a session's history it outlives the run and becomes the last instruction the
-    model sees when the operator writes again — and the model obeys it: it
-    reports what it "did not manage to finish" and calls nothing, turn after
-    turn, although every tool is back on the surface. That is what happened when
-    a wind-down's own final turn died on the provider that caused it: the run
-    failed with the notice as its last word, and the operator's "continue" got
-    a farewell.
-
-    Called at the end of every drive that reaches a terminal state, success or
-    failure alike. A drive that pauses (awaiting an answer) or is interrupted
-    keeps it: the run is not over, and a resumed run stays wound down.
-    """
-    key = SYNTHETIC_RECOVERY_METADATA_KEY
-    before = len(engine.history)
-    engine.history[:] = [
-        m for m in engine.history if m.metadata.get(key) != SYNTHETIC_RECOVERY_SOFT_STOP
-    ]
-    return before - len(engine.history)
 
 
 def finalize(engine: QueryEngine) -> TurnEvent | None:
@@ -398,7 +344,6 @@ __all__ = [
     "CAUSES",
     "CAUSE_DEADLINE",
     "CAUSE_MAX_TURNS",
-    "CAUSE_MODEL_NO_PROGRESS",
     "CAUSE_OUTPUT_TOKEN_BUDGET",
     "CAUSE_PROVIDER_ERROR",
     "CAUSE_TOOL_CALL_BUDGET",
@@ -417,8 +362,6 @@ __all__ = [
     "finalize",
     "is_armed",
     "is_enabled",
-    "leave",
-    "restore",
     "restricted_policy",
     "stage",
     "terminal_surface",

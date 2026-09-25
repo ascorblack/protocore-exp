@@ -6,11 +6,12 @@ that it is a page of text the request carries again on every call for the rest
 of the run, and ten of them are a context window. Eviction
 (:mod:`protocore.runtime.result_eviction`) answers the same problem by dropping
 a result whole, which is right for a read of a file that is still on disk and
-wrong for everything else: a search, an HTTP body, a tool whose output cannot be
-asked for again cheaply. This is the middle answer — keep the head, say what was
+wrong for everything else: a search, an HTTP body, a page fetched from a
+catalogue, a tool whose output cannot be asked for again cheaply. This is the
+middle answer — keep the head, keep what identifies the result, say what was
 cut, say how to get the rest back.
 
-Three properties are what make it safe to leave on:
+Four properties are what make it safe to leave on:
 
 *Age, not size alone.* Two things are never touched, however long they are: the
 newest :attr:`~LoopConstants.tool_result_fresh_count` results, and every result
@@ -18,8 +19,8 @@ of the latest round — the last batch of tool calls in the view together with t
 results answering it. That is the unit the model is about to read, and cutting
 inside it is the bug a size-only rule has, and the reason the split projection
 is not simply turned up. Everything older is eligible, including earlier rounds
-of the run in flight: a run that reads twenty files to answer one question is
-exactly the run this is for, and the first of those files is not what its answer
+of the run in flight: a run that reads twenty pages to answer one question is
+exactly the run this is for, and the first of those pages is not what its answer
 is being written from any more.
 
 *Batches, not drips.* Every rewrite of the view changes the prompt prefix, and a
@@ -31,7 +32,17 @@ results goes at once.
 
 *Sticky.* Once trimmed, a result stays trimmed for the rest of the run: the ids
 live on the engine, not in the text. Re-deciding per build would let a result
-come back whole after the batch that cut it, and the prefix would flap.
+come back whole after the batch that cut it, and the prefix would flap. The set
+is part of the engine snapshot, so a run resumed in another process keeps the
+prefix it had.
+
+*Identity survives the body.* A result that carries the line telling the model
+how to cite what it just read cannot lose that line to the trim: a citation the
+model cannot see is a citation it invents. Every line of the cut part whose text
+starts with one of
+:attr:`~LoopConstants.tool_result_stale_trim_protected_prefixes` is carried over
+verbatim, ahead of the pointer. The prefixes are configuration, so the rule says
+nothing about which tools a deployment runs.
 
 Persist is never touched. Like eviction and the compaction checkpoint, this
 rewrites the copy handed to the provider and leaves ``engine.history`` holding
@@ -74,11 +85,74 @@ def _calls_of_the_latest_round(history: Sequence[Message]) -> frozenset[str]:
     return frozenset()
 
 
-def _pointer(prompts: IPromptTemplateProvider, dropped: int, fresh_count: int) -> str:
-    """The line that replaces what was cut: how much went and how to get it back."""
-    return prompts.render(
-        "result_stale_trim", {"dropped_chars": dropped, "fresh_count": fresh_count}
+def _protected_prefixes(raw: str) -> tuple[str, ...]:
+    """The configured line prefixes, in the order they were written."""
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _carried_lines(content: str, head: int, prefixes: Sequence[str]) -> list[str]:
+    """Lines of the cut part that identify the result and must be kept.
+
+    A line is carried when it is not wholly inside the head — a line that ends
+    past the cut is a line the model would otherwise see truncated or not at
+    all — and when its text starts with one of the configured prefixes.
+    """
+    if not prefixes:
+        return []
+    carried: list[str] = []
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        offset += len(line)
+        text = line.strip()
+        if offset > head and any(text.startswith(prefix) for prefix in prefixes):
+            carried.append(text)
+    return carried
+
+
+def _shortened(
+    content: str,
+    head: int,
+    prefixes: Sequence[str],
+    prompts: IPromptTemplateProvider,
+    fresh_count: int,
+) -> str:
+    """The head, the lines that identify the result, and the pointer."""
+    carried = _carried_lines(content, head, prefixes)
+    kept = min(head + sum(len(line) for line in carried), len(content))
+    pointer = prompts.render(
+        "result_stale_trim",
+        {
+            "kept_chars": kept,
+            "dropped_chars": max(len(content) - kept, 0),
+            "fresh_count": fresh_count,
+        },
     )
+    return "\n".join([content[:head], *carried, pointer])
+
+
+def _widest_rest(
+    content: str,
+    prefixes: Sequence[str],
+    prompts: IPromptTemplateProvider,
+    fresh_count: int,
+) -> int:
+    """An upper bound on everything :func:`_shortened` adds after the head.
+
+    Every line the content can carry over, plus the pointer rendered with the
+    largest numbers it could ever name. Cutting a longer head only ever removes
+    a carried line or takes a digit off one of the numbers, so a head sized
+    against this bound cannot overflow the limit it was sized for.
+    """
+    carried = _carried_lines(content, 0, prefixes)
+    pointer = prompts.render(
+        "result_stale_trim",
+        {
+            "kept_chars": len(content),
+            "dropped_chars": len(content),
+            "fresh_count": fresh_count,
+        },
+    )
+    return len("\n".join(["", *carried, pointer]))
 
 
 def trim_stale_results(
@@ -101,6 +175,7 @@ def trim_stale_results(
         return list(history), sticky
 
     limit = rc.tool_result_stale_max_chars
+    prefixes = _protected_prefixes(rc.tool_result_stale_trim_protected_prefixes)
     #: The split projection runs over this same view immediately after the trim
     #: (:func:`protocore.runtime.query._llm_history`) and cuts at a limit of its
     #: own, appending its own pointer over the one written here. The two are
@@ -175,17 +250,18 @@ def trim_stale_results(
                 new_blocks.append(existing)
                 continue
             head = limit
-            pointer = _pointer(prompts, len(existing.content) - head, fresh_count)
-            if split_limit is not None and head + 1 + len(pointer) > split_limit:
-                # Size the head against the longest the pointer can become:
-                # cutting more only ever adds digits to the number it names.
-                widest = _pointer(prompts, len(existing.content), fresh_count)
-                head = max(split_limit - len(widest) - 1, 0)
-                pointer = _pointer(prompts, len(existing.content) - head, fresh_count)
+            shortened = _shortened(existing.content, head, prefixes, prompts, fresh_count)
+            if split_limit is not None and len(shortened) > split_limit:
+                # Size the head against the widest the rest can become: every
+                # line the content can carry over, and the pointer with its
+                # largest numbers, since cutting more only adds digits to them.
+                widest = _widest_rest(existing.content, prefixes, prompts, fresh_count)
+                head = max(split_limit - widest, 0)
+                shortened = _shortened(existing.content, head, prefixes, prompts, fresh_count)
             new_blocks.append(
                 existing.model_copy(
                     update={
-                        "content": existing.content[:head] + "\n" + pointer,
+                        "content": shortened,
                         "metadata": {**existing.metadata, "stale_trimmed": True},
                     }
                 )

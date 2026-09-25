@@ -265,10 +265,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/query.py::_emit_llm_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
-    "protocore/runtime/soft_stop.py::leave": _whole(
-        "removes the wind-down notice wherever it sits in the session transcript, however it "
-        "got there: the executor's seed may carry one whose wind-down was never driven to its end"
-    ),
     "protocore/runtime/query.py::_emit_empty_completion_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
@@ -430,6 +426,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::TokenEstimator.estimate_history_uncalibrated": (
         _whole("token accounting over the sequence it is handed")
     ),
+    "protocore/runtime/context/compaction.py::_prune_failed_anchor_keys": _whole(
+        "the census it prunes is keyed by anchors anywhere in the transcript, "
+        "so the question 'is this unit still here' is asked of all of it"
+    ),
     "protocore/runtime/context/compaction.py::run_tier1_truncation": _whole(
         "sheds bytes from the whole transcript so it fits the context window"
     ),
@@ -464,6 +464,34 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/context/compaction.py::run_tier3_fold": _whole(
         "folds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::tier1_has_work": _whole(
+        "asks, without rewriting, what Tier 1 would shed anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_plan_tier2": _whole(
+        "decides which units anywhere in the transcript Tier 2 would send"
+    ),
+    "protocore/runtime/context/compaction.py::tier2_has_work": _whole(
+        "asks, without calling the summariser, whether Tier 2 has a unit to send"
+    ),
+    "protocore/runtime/context/compaction.py::tier3_has_work": _whole(
+        "asks, without folding, whether the transcript holds a span to fold"
+    ),
+    "protocore/runtime/context/manager.py::ContextManager.has_proactive_work": _whole(
+        "asks every tier whether a proactive pass over the transcript would change it"
+    ),
+    "protocore/runtime/query.py::_current_prompt_tokens": _whole(
+        "measures the whole prompt, which is what the backoff's growth bound compares"
+    ),
+    "protocore/runtime/query.py::_suspend_proactive_compaction": _whole(
+        "records the size of the whole prompt, which is what the growth bound measures"
+    ),
+    "protocore/runtime/query.py::_proactive_llm_tiers_allowed": _whole(
+        "measures the whole prompt's growth since the suspension began"
+    ),
+    "protocore/runtime/query.py::_proactive_pass_is_idle": _whole(
+        "compares the transcript with the one the last idle probe saw, then asks "
+        "the tiers about all of it, as the pass itself would"
     ),
     "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
         "hands the whole transcript to the Tier-3 fold after Tier-2"
@@ -500,6 +528,14 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "request; it reaches no engine and selects nothing"
     ),
     # --- identity lookups keyed on a tool call id ---------------------------
+    "protocore/runtime/query.py::_run_produced_output": _run_scoped(
+        "asks whether there is anything a final answer could be about, and "
+        "looks only after the LAST message the caller put in — the operator's "
+        "task, or the tool result a parked run was resumed with. A seeded turn "
+        "precedes that message, so nothing from an earlier run is in the span "
+        "it walks",
+        f"{_CLAIMS}::test_produced_output_ignores_a_seeded_prior_run",
+    ),
     "protocore/runtime/query.py::_tool_name_for_call_id": _run_scoped(
         "resolves ONE tool_call_id to its tool name; a call id identifies a "
         "single call, so the search cannot land on another run's",
@@ -529,18 +565,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
             "structural check that ONE approved tool call matches its pending tool_use block",
             f"{_CLAIMS}::test_pending_tool_use_assertion_is_keyed_on_the_approved_call",
         )
-    ),
-    # --- what the round now driving has produced ----------------------------
-    "protocore/runtime/query.py::_this_round_messages": _run_scoped(
-        "answers about the round now driving: it starts at the message AFTER "
-        "the last one a caller put in — the operator's prompt, or the tool "
-        "result a parked run was resumed with — so a prior run's prose and "
-        "tool calls precede the boundary and cannot answer it. The boundary is "
-        "re-derived rather than taken from the seed tag because the tag is set "
-        "by the executor and not by every host, and a host that hands over a "
-        "session's earlier turns verbatim would otherwise have the predicate "
-        "answer for a run that is over",
-        f"{_CLAIMS}::test_produced_output_is_about_the_round_now_driving",
     ),
     # --- the tail --------------------------------------------------------
     "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected": _run_scoped(
@@ -601,6 +625,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/query_engine.py::QueryEngine.needs_compaction": _whole(
         "token accounting over the whole transcript"
+    ),
+    "protocore/runtime/query.py::_calibrate_near_compaction_trigger": _whole(
+        "sizes the same whole transcript the compaction gate measures, so the "
+        "gate reads the provider's count of what it decides on"
     ),
     "protocore/runtime/query_engine.py::QueryEngine.needs_emergency_compaction": _whole(
         "token accounting over the whole transcript"
@@ -1461,6 +1489,30 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
         "run of the session is not an operator turn of this one, so neither "
         "Tier 2 nor the fold may treat it as one. The callers work by INDEX "
         "into the whole list, which a filtered copy cannot express"
+    ),
+    "protocore/runtime/context/compaction.py::run_tier2_summarisation": (
+        "reactive compaction preserves seed provenance while replacing units "
+        "by INDEX into the whole list"
+    ),
+    "protocore/runtime/context/compaction.py::_plan_tier2": (
+        "a unit that mixes seeded and current turns is left intact, decided "
+        "by INDEX into the whole list before any call is made"
+    ),
+    "protocore/runtime/context/compaction.py::_foldable_indices.is_foldable": (
+        "reactive folding classifies each indexed message without losing its "
+        "seed provenance"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_spans": (
+        "reactive folding splits indexed spans at seed/current boundaries"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_span": (
+        "a seed-only replacement inherits the provenance of the indexed span"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_item_text": (
+        "labels one indexed message for the fold summariser by its provenance"
+    ),
+    "protocore/runtime/context/compaction.py::run_tier3_fold": (
+        "reactive folding transfers seed provenance from each indexed span"
     ),
     "protocore/runtime/context/session_memory.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"
