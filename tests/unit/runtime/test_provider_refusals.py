@@ -42,7 +42,7 @@ from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
 _REFUSAL = (
-    "claude: HTTP 400: Client 1.0 does not support this model; "
+    "provider: HTTP 400: Client 1.0 does not support this model; "
     "version 1.2 or newer is required. (client_version_too_old)"
 )
 

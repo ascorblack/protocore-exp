@@ -41,7 +41,7 @@ exhaustively and reused across products.
 ## Install
 
 ```bash
-pip install protocore==2.0.0a21
+pip install protocore==2.0.0a22
 ```
 
 Name the version explicitly. The published release is a pre-release, and pip
@@ -61,7 +61,7 @@ Python ≥ 3.12. Runtime dependencies are `pydantic`, `jinja2`, and
 ### Extras
 
 ```bash
-pip install "protocore[testing]==2.0.0a21"   # run the conformance suites against your adapters
+pip install "protocore[testing]==2.0.0a22"   # run the conformance suites against your adapters
 ```
 
 `testing` adds a test runner and nothing more. `protocore.conformance` is a

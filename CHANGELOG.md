@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a22] - 2026-09-26
+
 ### Changed
 
 - **Compaction ends below its trigger or at a floor, whatever the summariser
